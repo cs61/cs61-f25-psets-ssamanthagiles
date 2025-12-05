@@ -7,10 +7,25 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <atomic>
+#include <thread>
+#include <vector>
 
 // io61.cc
-//    YOUR CODE HERE!
 
+// documenting transfer of locks structure
+// lock(A)
+// lock(B)
+// transfer
+// unlock(A)
+// unlock(B)
+
+
+// struct to hold information on range
+struct ragelock {
+    off_t off;
+    off_t len;
+    std::thread::id owner; // variable named owner with type thread::id
+};
 
 // io61_file
 //    Data structure for io61 file wrappers.
@@ -32,10 +47,47 @@ struct io61_file {
     bool positioned = false;  // is cache in positioned mode?
 
     // Phase 1: "coarse-grained file range lock"
-    std::recursive_mutex flock_mutex; // holds the file lock for mutual exclusion
-                                        // meaning that only one thread can hold the lock at a time
+    // mutex = mututal exclusion meaning only one thread can hold the lock at a time
+    std::recursive_mutex flock_mutex; // variable named flock_mutex with type recursive_mutex
+    // each transfer involves 2 accounts
+    // each account has separate lock region
+    // transfer has to hold both lock simultaneously
+    // so same thread calls io61_lock twice (therefore need recursive mutex instead of standard mutex)
+
+    std::vector<ragelock> locks_held; // vector to hold the ranges that are currently locked by this io61_file
 };
 
+// check if two ranges overlap
+static bool ranges_overlap(off_t off1, off_t len1, off_t off2, off_t len2) {
+    
+    // setting the ends of the ranges
+    off_t end1 = off1 + len1;
+    off_t end2 = off2 + len2;
+    
+    // return true if the 2 ranges overlap
+    // return false if the 2 ranges don't overlap 
+    return !(end1 <= off2 || end2 <= off1);
+}   
+
+// check for overlapping locks
+static bool has_overlapping_lock(io61_file* f, off_t off, off_t len) {
+    // me is the id of the current thread
+    std::thread::id me = std::this_thread::get_id();
+    
+    // while iterating through the locks held by this io61_file
+    for (const ragelock& lk : f->locks_held) {
+
+        // if the lock id is not me, then it's owned by a diff thread and 
+        // the current thread (me) can't aquire the lock
+        // also check if the ranges overlap
+        if (lk.owner != me && ranges_overlap(lk.off, lk.len, off, len)) {
+            // in the case that both are true, return true
+            return true;
+        }
+   }
+   // if not return false and can acquire the lock for the given range
+   return false;
+}
 
 // io61_fdopen(fd, mode)
 //    Returns a new io61_file for file descriptor `fd`. `mode` is either
@@ -389,21 +441,39 @@ int io61_try_lock(io61_file* f, off_t off, off_t len, int locktype) {
         return 0;
     }
 
+    // phase 2, protect access to locks_held vector using recursive mutex
+    std::lock_guard<std::recursive_mutex> guard(f->flock_mutex);
+
     // phase 1, ignore [off, off + len) range checking for now
     // bc we trust caller to only lock non-overlapping ranges
     // try to acquire the lock without blocking
-    if (f->flock_mutex.try_lock()) {
-        // got lock
-        return 0;
-    } else {
-        // did not get lock
-        errno = EAGAIN; // EAGAIN indicates that the byte range is already locked by another thread
-        return -1;
-    }
+    if (has_overlapping_lock(f, off, len)) {
+        // overlapping lock exists
 
+        // print error message
+        errno = EAGAIN; 
+        // indicate that lock could not be acquired
+        return -1;
+    }   
+
+    // no overlapping lock exists, so acquire the lock
+    // new_lock is a new ragelock struct to hold the range being locked
+    ragelock new_lock;
+    // setting the fields of the new_lock struct
+
+    // off = starting offset of the range being locked
+    new_lock.off = off;
+    // len = length of the range being locked
+    new_lock.len = len;
+    // owner = id of the current thread
+    new_lock.owner = std::this_thread::get_id();
+    // adding the new_lock to the locks_held vector of the io61_file
+    // using push_back to add the new_lock to the end of the vector
+    // add to end bc order of locks held doesn't matter
+    f->locks_held.push_back(new_lock);
+    // indicate that lock was successfully acquired
     return 0;
 }
-
 
 // io61_lock(f, off, len, locktype)
 //    Acquire a lock on offsets `[off, off + len)` in file `f`.
@@ -441,10 +511,23 @@ int io61_unlock(io61_file* f, off_t off, off_t len) {
         // nothing to unlock, so return 0
         return 0;
     }
-    // phase 1, ignore [off, off + len) range checking for now
-    // bc we trust caller to only unlock ranges it has locked
-    // release the lock
-    f->flock_mutex.unlock();
+
+    // phase 2, protect access to locks_held vector using recursive mutex
+    std::lock_guard<std::recursive_mutex> guard(f->flock_mutex);
+    // find the lock in locks_held vector and remove it
+    std::thread::id me = std::this_thread::get_id();
+    // while iterating through the locks held by this io61_file
+    for (auto it = f->locks_held.begin(); it != f->locks_held.end(); ++it) {
+        // if the owner is me and the off and len match
+        if (it->owner == me && it->off == off && it->len == len) {
+            // can "unlock" the lock by removing it from the locks_held vector
+            f->locks_held.erase(it);
+            // indicate that unlock was successful
+            return 0;
+        }
+    }
+    // if we reach here, the lock was not found
+    // still need to return 0 bc unlocking a non-existent lock is not an error
     return 0;
 }
 
