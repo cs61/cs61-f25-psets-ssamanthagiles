@@ -43,11 +43,8 @@ struct io61_file {
     off_t end_tag;
 
     // Positioned mode
-    bool dirty;
     bool positioned;
-
-    // OMIT: std::atomic, std::thread, std::recursive_mutex, vector<ragelock>
-    // bc they are already included in the header file io61.hh
+    bool dirty;
 
     std::recursive_mutex flock_mutex; // recursive mutex to protect locks_held vector
     std::vector<ragelock> locks_held; // vector to hold the locks held by this io61_file
@@ -135,6 +132,9 @@ io61_file* io61_fdopen(int fd, int mode) {
         f->tag = f->pos_tag = f->end_tag = 0;
     }
     f->dirty = f->positioned = false;
+
+    io61_maybe_unposition(f);
+
     return f;
 }
 
@@ -159,6 +159,9 @@ int io61_close(io61_file* f) {
 static int io61_fill(io61_file* f);
 
 int io61_readc(io61_file* f) {
+
+    io61_maybe_unposition(f);
+    
     assert(!f->positioned);
     if (f->pos_tag == f->end_tag) {
         io61_fill(f);
@@ -183,6 +186,10 @@ int io61_readc(io61_file* f) {
 //    This is called a “short read.”
 
 ssize_t io61_read(io61_file* f, unsigned char* buf, size_t sz) {
+    
+    // first, switch to non-positioned mode if necessary
+    io61_maybe_unposition(f);
+
     assert(!f->positioned);
     size_t nread = 0;
     while (nread != sz) {
@@ -209,6 +216,7 @@ ssize_t io61_read(io61_file* f, unsigned char* buf, size_t sz) {
 //    Returns 0 on success and -1 on error.
 
 int io61_writec(io61_file* f, int c) {
+    io61_maybe_unposition(f);
     assert(!f->positioned);
     if (f->pos_tag == f->tag + f->cbufsz) {
         int r = io61_flush(f);
@@ -232,6 +240,7 @@ int io61_writec(io61_file* f, int c) {
 //    before the error occurred.
 
 ssize_t io61_write(io61_file* f, const unsigned char* buf, size_t sz) {
+    io61_maybe_unposition(f);
     assert(!f->positioned);
     size_t nwritten = 0;
     while (nwritten != sz) {
@@ -283,6 +292,11 @@ int io61_flush(io61_file* f) {
 //    Returns 0 on success and -1 on failure.
 
 int io61_seek(io61_file* f, off_t off) {
+
+    if (io61_maybe_unposition(f) == -1) {
+        return -1;
+    }
+
     int r = io61_flush(f);
     if (r == -1) {
         return -1;
@@ -358,8 +372,15 @@ static int io61_flush_dirty_positioned(io61_file* f) {
 }
 
 static int io61_flush_clean(io61_file* f) {
+
+    // If we're in positioned mode, convert back to non-positioned mode.
+    // This will do the right lseek and reset tag/pos_tag/end_tag.
+    if (f->positioned) {
+        return io61_maybe_unposition(f);
+    }
+
     // Called when `f`’s cache is clean.
-    if (!f->positioned && f->seekable) {
+    if (f->seekable) {
         if (lseek(f->fd, f->pos_tag, SEEK_SET) == -1) {
             return -1;
         }
@@ -383,12 +404,27 @@ static int io61_pfill(io61_file* f, off_t off);
 
 ssize_t io61_pread(io61_file* f, unsigned char* buf, size_t sz,
                    off_t off) {
+    
+     // positioned I/O requires read/write
+     if (f->mode != O_RDWR) {
+        errno = EINVAL;
+        return -1;
+    }
+
     if (!f->positioned || off < f->tag || off >= f->end_tag) {
         if (io61_pfill(f, off) == -1) {
             return -1;
         }
     }
+    // compute number of bytes left in the cache from offset off
     size_t nleft = f->end_tag - off;
+    // if nothing left to read
+    if (nleft == 0) {
+        // then EOF and return 0
+        return 0;
+    }
+    
+    // copy as much as possible from cache to buf
     size_t ncopy = std::min(sz, nleft);
     memcpy(buf, &f->cbuf[off - f->tag], ncopy);
     return ncopy;
