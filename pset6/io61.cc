@@ -1,13 +1,15 @@
 #include "io61.hh"
 #include <climits>
 #include <cerrno>
-#include <mutex>
 #include <shared_mutex>
 #include <condition_variable>
-#include <sys/types.h>
-#include <sys/stat.h>
 #include <atomic>
 #include <thread>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <mutex>
 #include <vector>
 
 // io61.cc
@@ -28,34 +30,30 @@ struct ragelock {
 };
 
 // io61_file
-//    Data structure for io61 file wrappers.
-
 struct io61_file {
-    int fd = -1;     // file descriptor
-    int mode;        // O_RDONLY, O_WRONLY, or O_RDWR
-    bool seekable;   // is this file seekable?
+    int fd;
+    int mode;
+    bool seekable;
 
-    // Single-slot cache
-    static constexpr off_t cbufsz = 8192;
+    // Cache fields
+    enum { cbufsz = 8192 };
     unsigned char cbuf[cbufsz];
-    off_t tag;       // offset of first character in `cbuf`
-    off_t pos_tag;   // next offset to read or write (non-positioned mode)
-    off_t end_tag;   // offset one past last valid character in `cbuf`
+    off_t tag;
+    off_t pos_tag;
+    off_t end_tag;
 
     // Positioned mode
-    std::atomic<bool> dirty{false}; // check if cache is dirty (i.e. has been written to)
-    bool positioned = false;  // is cache in positioned mode?
+    bool dirty;
+    bool positioned;
 
-    // Phase 1: "coarse-grained file range lock"
-    // mutex = mututal exclusion meaning only one thread can hold the lock at a time
-    std::recursive_mutex flock_mutex; // variable named flock_mutex with type recursive_mutex
-    // each transfer involves 2 accounts
-    // each account has separate lock region
-    // transfer has to hold both lock simultaneously
-    // so same thread calls io61_lock twice (therefore need recursive mutex instead of standard mutex)
+    // OMIT: std::atomic, std::thread, std::recursive_mutex, vector<ragelock>
+    // bc they are already included in the header file io61.hh
 
-    std::vector<ragelock> locks_held; // vector to hold the ranges that are currently locked by this io61_file
+    std::recursive_mutex flock_mutex; // recursive mutex to protect locks_held vector
+    std::vector<ragelock> locks_held; // vector to hold the locks held by this io61_file
 };
+
+
 
 // check if two ranges overlap
 static bool ranges_overlap(off_t off1, off_t len1, off_t off2, off_t len2) {
@@ -87,6 +85,34 @@ static bool has_overlapping_lock(io61_file* f, off_t off, off_t len) {
    }
    // if not return false and can acquire the lock for the given range
    return false;
+}
+
+// forward dec of flush helper function
+static int io61_flush_dirty_positioned(io61_file* f);
+
+// switch from positioned to non-positioned mode
+static int io61_maybe_unposition(io61_file* f) {
+    if (!f->positioned) {
+        return 0;
+    }   
+    if (f->dirty){
+        if (io61_flush_dirty_positioned(f) == -1) {
+            return -1;
+        }
+    }
+    
+    if (f->seekable) {
+        if (lseek(f->fd, f->pos_tag, SEEK_SET) == -1) {
+            return -1;
+        }
+    }
+
+    // drop positioned cache; start with an empty non-positioned cache
+    f->tag = f->end_tag = f->pos_tag;
+    f->positioned = false;
+    f->dirty = false;
+
+    return 0;
 }
 
 // io61_fdopen(fd, mode)
