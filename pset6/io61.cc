@@ -6,6 +6,7 @@
 #include <condition_variable>
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <atomic>
 
 // io61.cc
 //    YOUR CODE HERE!
@@ -27,8 +28,12 @@ struct io61_file {
     off_t end_tag;   // offset one past last valid character in `cbuf`
 
     // Positioned mode
-    bool dirty = false;       // has cache been written?
+    std::atomic<bool> dirty{false}; // check if cache is dirty (i.e. has been written to)
     bool positioned = false;  // is cache in positioned mode?
+
+    // Phase 1: "coarse-grained file range lock"
+    std::recursive_mutex flock_mutex; // holds the file lock for mutual exclusion
+                                        // meaning that only one thread can hold the lock at a time
 };
 
 
@@ -373,12 +378,29 @@ static int io61_pfill(io61_file* f, off_t off) {
 //    always lock nonoverlapping ranges.
 
 int io61_try_lock(io61_file* f, off_t off, off_t len, int locktype) {
-    (void) f;
+    // off and len holds the range to be locked
+    // so checking if the range is valid
     assert(off >= 0 && len >= 0);
+    // LOCK_EX means exclusive lock (no other thread can hold the lock at the same time)
     assert(locktype == LOCK_EX);
+    // if the length is 0
     if (len == 0) {
+        // nothing to lock, so return 0
         return 0;
     }
+
+    // phase 1, ignore [off, off + len) range checking for now
+    // bc we trust caller to only lock non-overlapping ranges
+    // try to acquire the lock without blocking
+    if (f->flock_mutex.try_lock()) {
+        // got lock
+        return 0;
+    } else {
+        // did not get lock
+        errno = EAGAIN; // EAGAIN indicates that the byte range is already locked by another thread
+        return -1;
+    }
+
     return 0;
 }
 
@@ -412,11 +434,17 @@ int io61_lock(io61_file* f, off_t off, off_t len, int locktype) {
 //    previously acquired a lock on that offset range.
 
 int io61_unlock(io61_file* f, off_t off, off_t len) {
-    (void) f;
+    // check if the range is valid
     assert(off >= 0 && len >= 0);
+    // if the length is 0
     if (len == 0) {
+        // nothing to unlock, so return 0
         return 0;
     }
+    // phase 1, ignore [off, off + len) range checking for now
+    // bc we trust caller to only unlock ranges it has locked
+    // release the lock
+    f->flock_mutex.unlock();
     return 0;
 }
 
