@@ -50,8 +50,8 @@ struct io61_file {
      std::condition_variable_any cv;
  
      // split file into regions for fine-grained locking
-     static const int NREG = 128;
-     static const off_t REGION_SIZE = 8192 * 16;
+     static const int NREG = 1024;
+     static const off_t REGION_SIZE = 8192;
  
      struct region_lock {
          unsigned locked = 0;        // 0 = unlocked, >0 = locked by `owner`
@@ -526,12 +526,15 @@ int io61_try_lock(io61_file* f, off_t off, off_t len, int locktype) {
     // LOCK_EX means exclusive lock (no other thread can hold the lock at the same time)
     assert(locktype == LOCK_EX);
 
+    // get current thread id
+    std::thread::id me = std::this_thread::get_id();
+
     // phase 2, protect access to locks_held vector using recursive mutex
     std::unique_lock<std::mutex> guard (f->m);
     
     // Compute region range
-    int r1 = off / io61_file::REGION_SIZE;
-    int r2 = (off + len - 1) / io61_file::REGION_SIZE;
+    int r1 = file_region(off);
+    int r2 = file_region(off + len - 1);
 
     // Clamp to valid bounds
     if (r1 < 0) {
@@ -541,8 +544,6 @@ int io61_try_lock(io61_file* f, off_t off, off_t len, int locktype) {
     if (r2 >= io61_file::NREG){
         r2 = io61_file::NREG - 1;
     }
-
-    std::thread::id me = std::this_thread::get_id();
 
     // Check if any region is owned by someone else
     for (int r = r1; r <= r2; r++) {
@@ -554,10 +555,13 @@ int io61_try_lock(io61_file* f, off_t off, off_t len, int locktype) {
 
     // Otherwise acquire all regions
     for (int r = r1; r <= r2; r++) {
-        f->reg[r].locked = 1;
-        f->reg[r].owner = me;
+        if (f->reg[r].owner == me) {
+            f->reg[r].locked++; // recursive acquire
+        } else {
+            f->reg[r].locked = 1;
+            f->reg[r].owner = me;
+        }
     }
-
     return 0;
 }
 
@@ -580,44 +584,12 @@ int io61_lock(io61_file* f, off_t off, off_t len, int locktype) {
     // only exclusive locks supported
     assert(locktype == LOCK_EX);
 
-    // determine start and end regions
-    int r1 = off / io61_file::REGION_SIZE;
-    int r2 = (off + len - 1) / io61_file::REGION_SIZE;
-
-    if (r1 < 0) {
-        r1 = 0;
-    }
-
-    if (r2 >= io61_file::NREG) {
-        r2 = io61_file::NREG - 1;
-    }
-
-    // retreive current thread id
-    std::thread::id me = std::this_thread::get_id();
-
     // lock the mutex to protect access to the lock data structures
     std::unique_lock<std::mutex> lk(f->m);
 
-    while (true) {
-        bool free = true;
-    
-        for (int r = r1; r <= r2; r++) {
-            if (f->reg[r].locked && f->reg[r].owner != me) {
-                free = false;
-                break;
-            }
-        }
-    
-        if (free) {
-            // acquire
-            for (int r = r1; r <= r2; r++) {
-                f->reg[r].locked = 1;
-                f->reg[r].owner = me;
-            }
-            break;      // exit loop, lock acquired
-        }
-    
-        // Otherwise sleep until someone unlocks
+    // call try_lock in a loop until it succeeds
+    while(io61_try_lock(f, off, len, locktype) <  0) {
+        // wait on the condition variable until notified
         f->cv.wait(lk);
     }
 
@@ -635,24 +607,33 @@ int io61_unlock(io61_file* f, off_t off, off_t len) {
         return 0;
     }
 
-    int r1 = off / io61_file::REGION_SIZE;
-    int r2 = (off + len - 1) / io61_file::REGION_SIZE;
-
     std::thread::id me = std::this_thread::get_id();
 
     std::unique_lock<std::mutex> lk(f->m);
 
+    int r1 = file_region(off);
+    int r2 = file_region(off + len - 1);    
+
+    // Clamp to valid bounds
+    if (r1 < 0) {
+        r1 = 0;
+    } 
+
+    if (r2 >= io61_file::NREG){
+        r2 = io61_file::NREG - 1;
+    }
+   
     for (int r = r1; r <= r2; r++) {
         if (f->reg[r].owner == me) {
-            f->reg[r].locked = 0;
-            // owner field can optionally be reset
+            if (--f->reg[r].locked == 0) {
+                f->reg[r].owner = std::thread::id();  // reset owner
+            }
         }
     }
 
     f->cv.notify_all();
     return 0;
 }
-
 
 
 // HELPER FUNCTIONS
