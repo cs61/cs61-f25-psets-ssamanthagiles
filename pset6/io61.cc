@@ -528,9 +528,6 @@ int io61_try_lock(io61_file* f, off_t off, off_t len, int locktype) {
 
     // get current thread id
     std::thread::id me = std::this_thread::get_id();
-
-    // phase 2, protect access to locks_held vector using recursive mutex
-    std::unique_lock<std::mutex> guard (f->m);
     
     // Compute region range
     int r1 = file_region(off);
