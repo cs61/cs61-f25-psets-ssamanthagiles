@@ -24,6 +24,9 @@
 // coarse-grained -> big area locks
 // fine-grained -> small area locks, specific regions
 
+// polling = repeatedly checking if a condition is true
+// blocking = thread sleeps until condition is true
+
 
 // io61_file
 struct io61_file {
@@ -552,23 +555,37 @@ int io61_try_lock(io61_file* f, off_t off, off_t len, int locktype) {
 //    your code need not detect deadlock.
 
 int io61_lock(io61_file* f, off_t off, off_t len, int locktype) {
-    if (len == 0) {
-        return 0;
-    }
-    assert(locktype == LOCK_EX);
+    // determine start and end regions
+    int r1 = off / io61_file::REGION_SIZE;
+    int r2 = (off + len - 1) / io61_file::REGION_SIZE;
 
-    std::unique_lock<std::mutex> guard(f->m);
+    // retreive current thread id
+    std::thread::id me = std::this_thread::get_id();
 
-    while (may_overlap_with_other_lock(f, off, len)) {
-        f->cv.wait(guard);
-    }
+    // lock the mutex to protect access to the lock data structures
+    std::unique_lock<std::mutex> lk(f->m);
 
-    int rstart = file_region(off);
-    int rend   = file_region(off + len - 1);
-
-    for (int ri = rstart; ri <= rend; ++ri) {
-        ++f->reg[ri].locked;
-        f->reg[ri].owner = std::this_thread::get_id();
+    while (true) {
+        bool free = true;
+    
+        for (int r = r1; r <= r2; r++) {
+            if (f->reg[r].locked && f->reg[r].owner != me) {
+                free = false;
+                break;
+            }
+        }
+    
+        if (free) {
+            // acquire
+            for (int r = r1; r <= r2; r++) {
+                f->reg[r].locked = 1;
+                f->reg[r].owner = me;
+            }
+            break;      // exit loop, lock acquired
+        }
+    
+        // Otherwise sleep until someone unlocks
+        f->cv.wait(lk);
     }
 
     return 0;
@@ -581,19 +598,18 @@ int io61_lock(io61_file* f, off_t off, off_t len, int locktype) {
 //    previously acquired a lock on that offset range.
 
 int io61_unlock(io61_file* f, off_t off, off_t len) {
-      // if the length is 0
-      if (len == 0) {
-        // nothing to unlock, so return 0
-        return 0;
-    }
+    int r1 = off / io61_file::REGION_SIZE;
+    int r2 = (off + len - 1) / io61_file::REGION_SIZE;
 
-    std::unique_lock<std::mutex> guard(f->m);
+    std::thread::id me = std::this_thread::get_id();
 
-    int rstart = file_region(off);
-    int rend   = file_region(off + len - 1);
+    std::unique_lock<std::mutex> lk(f->m);
 
-    for (int ri = rstart; ri <= rend; ++ri) {
-        --f->reg[ri].locked;
+    for (int r = r1; r <= r2; r++) {
+        if (f->reg[r].owner == me) {
+            f->reg[r].locked = 0;
+            // owner field can optionally be reset
+        }
     }
 
     f->cv.notify_all();
