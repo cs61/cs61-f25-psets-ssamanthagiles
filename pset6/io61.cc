@@ -55,7 +55,7 @@ struct io61_file {
  
      // split file into regions for fine-grained locking
      static const int NREG = 1024;
-     static const off_t REGION_SIZE = 8192;
+     static const off_t REGION_SIZE = cbufsz;
  
     struct region_lock {
         unsigned locked = 0;        // 0 = unlocked, >0 = locked by `owner`
@@ -449,8 +449,13 @@ ssize_t io61_pread(io61_file* f, unsigned char* buf, size_t sz,
     // 2. Protect internal cache state
     std::lock_guard<std::mutex> g(f->io_mu);
 
-    // Make sure cache contains the requested offset
-    if (!f->positioned || off < f->tag || off >= f->end_tag) {
+    bool window_ok =
+    f->positioned &&
+    off >= f->tag &&
+    off + (off_t) sz <= f->end_tag &&
+    (f->end_tag - f->tag == io61_file::cbufsz);
+
+    if (!window_ok) {
         if (io61_pfill_locked(f, off) == -1) {
             io61_unlock(f, off, sz);
             return -1;
@@ -493,7 +498,13 @@ ssize_t io61_pwrite(io61_file* f, const unsigned char* buf, size_t sz,
     // 2. Protect internal cache state
     std::lock_guard<std::mutex> g(f->io_mu);
 
-    if (!f->positioned || off < f->tag || off >= f->end_tag) {
+    bool window_ok =
+    f->positioned &&
+    off >= f->tag &&
+    off + (off_t) sz <= f->end_tag &&
+    (f->end_tag - f->tag == io61_file::cbufsz);
+
+    if (!window_ok) {
         if (io61_pfill_locked(f, off) == -1) {
             io61_unlock(f, off, sz);
             return -1;
@@ -519,12 +530,13 @@ static int io61_pfill_locked(io61_file* f, off_t off) {
     assert(f->mode == O_RDWR);
 
     // If positioned cache is dirty, flush it under the same lock
-    if (f->dirty && io61_flush_locked(f) == -1) {
-        return -1;
+    if (f->dirty) {
+        if (io61_flush_dirty_positioned(f) == -1) {
+            return -1;
+        }
     }
 
-    // Align `off` down to a multiple of 8192
-    off = off - (off % 8192);
+    off = off - (off % io61_file::cbufsz);
 
     ssize_t nr = pread(f->fd, f->cbuf, f->cbufsz, off);
     if (nr == -1) {
@@ -569,36 +581,32 @@ int io61_try_lock(io61_file* f, off_t off, off_t len, int locktype) {
     // get current thread id
     std::thread::id me = std::this_thread::get_id();
     
-    // Compute region range
-    int r1 = file_region(off);
-    int r2 = file_region(off + len - 1);
+    int r = file_region(off);
 
     // Clamp to valid bounds
-    if (r1 < 0) {
-        r1 = 0;
+    if (r < 0) {
+        r = 0;
     } 
 
-    if (r2 >= io61_file::NREG){
-        r2 = io61_file::NREG - 1;
+    if (r >= io61_file::NREG){
+        r = io61_file::NREG - 1;
     }
 
-    // Check if any region is owned by someone else
-    for (int r = r1; r <= r2; r++) {
-        if (f->reg[r].locked && f->reg[r].owner != me) {
-            errno = EAGAIN;
-            return -1;   // cannot acquire immediately
-        }
+    io61_file::region_lock& reg = f->reg[r];
+    // If another thread owns it, fail immediately
+    if (reg.locked > 0 && reg.owner != me) {
+        errno = EAGAIN;
+        return -1;
     }
 
-    // Otherwise acquire all regions
-    for (int r = r1; r <= r2; r++) {
-        if (f->reg[r].owner == me) {
-            f->reg[r].locked++; // recursive acquire
-        } else {
-            f->reg[r].locked = 1;
-            f->reg[r].owner = me;
-        }
+    // Otherwise acquire it
+    if (reg.owner == me) {
+        reg.locked++;
+    } else {
+        reg.locked = 1;
+        reg.owner = me;
     }
+
     return 0;
 }
 
@@ -613,25 +621,21 @@ int io61_try_lock(io61_file* f, off_t off, off_t len, int locktype) {
 //    your code need not detect deadlock.
 
 int io61_lock(io61_file* f, off_t off, off_t len, int locktype) {
-
     if (len == 0) {
         return 0;
     }
 
-    // only exclusive locks supported
     assert(locktype == LOCK_EX);
 
-    // lock the mutex to protect access to the lock data structures
     std::unique_lock<std::mutex> lk(f->m);
 
-    // call try_lock in a loop until it succeeds
-    while(io61_try_lock(f, off, len, locktype) <  0) {
-        // wait on the condition variable until notified
+    while (io61_try_lock(f, off, len, locktype) < 0) {
         f->cv.wait(lk);
     }
 
     return 0;
 }
+
 
 
 // io61_unlock(f, off, len)
@@ -640,37 +644,29 @@ int io61_lock(io61_file* f, off_t off, off_t len, int locktype) {
 //    previously acquired a lock on that offset range.
 
 int io61_unlock(io61_file* f, off_t off, off_t len) {
-    if (len == 0){
+    if (len == 0) {
         return 0;
     }
 
     std::thread::id me = std::this_thread::get_id();
-
     std::unique_lock<std::mutex> lk(f->m);
 
-    int r1 = file_region(off);
-    int r2 = file_region(off + len - 1);    
+    int r = file_region(off);
+    if (r < 0) r = 0;
+    if (r >= io61_file::NREG) r = io61_file::NREG - 1;
 
-    // Clamp to valid bounds
-    if (r1 < 0) {
-        r1 = 0;
-    } 
+    io61_file::region_lock& reg = f->reg[r];
 
-    if (r2 >= io61_file::NREG){
-        r2 = io61_file::NREG - 1;
-    }
-   
-    for (int r = r1; r <= r2; r++) {
-        if (f->reg[r].owner == me) {
-            if (--f->reg[r].locked == 0) {
-                f->reg[r].owner = std::thread::id();  // reset owner
-            }
+    if (reg.owner == me) {
+        if (--reg.locked == 0) {
+            reg.owner = std::thread::id();
         }
     }
 
     f->cv.notify_all();
     return 0;
 }
+
 
 
 // HELPER FUNCTIONS
