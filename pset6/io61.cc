@@ -441,13 +441,18 @@ ssize_t io61_pread(io61_file* f, unsigned char* buf, size_t sz,
     // Acquire coarse-grained range lock
     io61_lock(f, off, sz, LOCK_EX);
     
+    // declaring ncopy before lock_guard scope
+    size_t ncopy = 0;
+    
+    {
+
     // protect io61 internal state before positioned I/O
     std::lock_guard<std::mutex> g(f->io_mu);
 
      // positioned I/O requires read/write
      if (f->mode != O_RDWR) {
-        errno = EINVAL;
         io61_unlock(f, off, sz);
+        errno = EINVAL;
         return -1;
     }
 
@@ -459,19 +464,13 @@ ssize_t io61_pread(io61_file* f, unsigned char* buf, size_t sz,
     }
     // compute number of bytes left in the cache from offset off
     size_t nleft = f->end_tag - off;
-    // if nothing left to read
-    if (nleft == 0) {
-        io61_unlock(f, off, sz);
-        return 0;
-    }
-    
-    // copy as much as possible from cache to buf
-    size_t ncopy = std::min(sz, nleft);
+    ncopy = std::min(sz, nleft);
     memcpy(buf, &f->cbuf[off - f->tag], ncopy);
+
+    }  // release io61 internal state lock
 
     // Release range lock
     io61_unlock(f, off, sz);
-
     return ncopy;
 }
 
