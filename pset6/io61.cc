@@ -528,17 +528,34 @@ int io61_try_lock(io61_file* f, off_t off, off_t len, int locktype) {
 
     // phase 2, protect access to locks_held vector using recursive mutex
     std::unique_lock<std::mutex> guard (f->m);
-    if (may_overlap_with_other_lock(f, off, len)) {
-        errno = EAGAIN;
-        return -1;
+    
+    // Compute region range
+    int r1 = off / io61_file::REGION_SIZE;
+    int r2 = (off + len - 1) / io61_file::REGION_SIZE;
+
+    // Clamp to valid bounds
+    if (r1 < 0) {
+        r1 = 0;
+    } 
+
+    if (r2 >= io61_file::NREG){
+        r2 = io61_file::NREG - 1;
     }
 
-    int rstart = file_region(off);
-    int rend   = file_region(off + len - 1);
+    std::thread::id me = std::this_thread::get_id();
 
-    for (int ri = rstart; ri <= rend; ++ri) {
-        ++f->reg[ri].locked;
-        f->reg[ri].owner = std::this_thread::get_id();
+    // Check if any region is owned by someone else
+    for (int r = r1; r <= r2; r++) {
+        if (f->reg[r].locked && f->reg[r].owner != me) {
+            errno = EAGAIN;
+            return -1;   // cannot acquire immediately
+        }
+    }
+
+    // Otherwise acquire all regions
+    for (int r = r1; r <= r2; r++) {
+        f->reg[r].locked = 1;
+        f->reg[r].owner = me;
     }
 
     return 0;
@@ -555,9 +572,25 @@ int io61_try_lock(io61_file* f, off_t off, off_t len, int locktype) {
 //    your code need not detect deadlock.
 
 int io61_lock(io61_file* f, off_t off, off_t len, int locktype) {
+
+    if (len == 0) {
+        return 0;
+    }
+
+    // only exclusive locks supported
+    assert(locktype == LOCK_EX);
+
     // determine start and end regions
     int r1 = off / io61_file::REGION_SIZE;
     int r2 = (off + len - 1) / io61_file::REGION_SIZE;
+
+    if (r1 < 0) {
+        r1 = 0;
+    }
+
+    if (r2 >= io61_file::NREG) {
+        r2 = io61_file::NREG - 1;
+    }
 
     // retreive current thread id
     std::thread::id me = std::this_thread::get_id();
@@ -598,6 +631,10 @@ int io61_lock(io61_file* f, off_t off, off_t len, int locktype) {
 //    previously acquired a lock on that offset range.
 
 int io61_unlock(io61_file* f, off_t off, off_t len) {
+    if (len == 0){
+        return 0;
+    }
+
     int r1 = off / io61_file::REGION_SIZE;
     int r2 = (off + len - 1) / io61_file::REGION_SIZE;
 
