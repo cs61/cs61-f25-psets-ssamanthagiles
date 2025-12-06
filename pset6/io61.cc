@@ -44,18 +44,22 @@ struct io61_file {
     // Positioned mode
     bool positioned;
     bool dirty;
-     // protects all range-lock metadata
-     std::mutex m;
-     // used to sleep/wake threads waiting on locks
-     std::condition_variable_any cv;
+
+    // coarse-grained lock for normal I/O (read/write/flush/seek)
+    std::mutex io_mu;
+    
+    // protects all range-lock metadata
+    std::mutex m;
+    // used to sleep/wake threads waiting on locks
+    std::condition_variable_any cv;
  
      // split file into regions for fine-grained locking
      static const int NREG = 1024;
      static const off_t REGION_SIZE = 8192;
  
-     struct region_lock {
-         unsigned locked = 0;        // 0 = unlocked, >0 = locked by `owner`
-         std::thread::id owner = std::thread::id();  // empty "no thread";      // which thread owns this region
+    struct region_lock {
+        unsigned locked = 0;        // 0 = unlocked, >0 = locked by `owner`
+        std::thread::id owner = std::thread::id();  // empty "no thread";      // which thread owns this region
      };
  
      region_lock reg[NREG];          // lock state for each region
@@ -120,6 +124,10 @@ int io61_try_lock(io61_file* f, off_t off, off_t len, int locktype);
 int io61_lock(io61_file* f, off_t off, off_t len, int locktype);
 int io61_unlock(io61_file* f, off_t off, off_t len);
 
+// forward dec for flush function
+static int io61_flush_locked(io61_file* f);
+
+
 // io61_fdopen(fd, mode)
 //    Returns a new io61_file for file descriptor `fd`. `mode` is either
 //    O_RDONLY for a read-only file, O_WRONLY for a write-only file,
@@ -168,6 +176,8 @@ static int io61_fill(io61_file* f);
 
 int io61_readc(io61_file* f) {
 
+    std::lock_guard<std::mutex> g(f->io_mu);
+
     io61_maybe_unposition(f);
     
     assert(!f->positioned);
@@ -194,7 +204,8 @@ int io61_readc(io61_file* f) {
 //    This is called a “short read.”
 
 ssize_t io61_read(io61_file* f, unsigned char* buf, size_t sz) {
-    
+    std::lock_guard<std::mutex> g(f->io_mu);
+
     // first, switch to non-positioned mode if necessary
     io61_maybe_unposition(f);
 
@@ -224,10 +235,12 @@ ssize_t io61_read(io61_file* f, unsigned char* buf, size_t sz) {
 //    Returns 0 on success and -1 on error.
 
 int io61_writec(io61_file* f, int c) {
+    std::lock_guard<std::mutex> g(f->io_mu);
+
     io61_maybe_unposition(f);
     assert(!f->positioned);
     if (f->pos_tag == f->tag + f->cbufsz) {
-        int r = io61_flush(f);
+        int r = io61_flush_locked(f);
         if (r == -1) {
             return -1;
         }
@@ -248,12 +261,13 @@ int io61_writec(io61_file* f, int c) {
 //    before the error occurred.
 
 ssize_t io61_write(io61_file* f, const unsigned char* buf, size_t sz) {
+    std::lock_guard<std::mutex> g(f->io_mu);
     io61_maybe_unposition(f);
     assert(!f->positioned);
     size_t nwritten = 0;
     while (nwritten != sz) {
         if (f->end_tag == f->tag + f->cbufsz) {
-            int r = io61_flush(f);
+            int r = io61_flush_locked(f);
             if (r == -1 && nwritten == 0) {
                 return -1;
             } else if (r == -1) {
@@ -280,11 +294,15 @@ ssize_t io61_write(io61_file* f, const unsigned char* buf, size_t sz) {
 //    If `f` was opened read-only and is seekable, `io61_flush(f)` drops any
 //    data cached for reading and seeks to the logical file position.
 
+// forward decs for flush helper functions
 static int io61_flush_dirty(io61_file* f);
 static int io61_flush_dirty_positioned(io61_file* f);
 static int io61_flush_clean(io61_file* f);
+static int io61_flush_locked(io61_file* f);
 
-int io61_flush(io61_file* f) {
+
+// Internal helper: assumes caller already holds f->io_mu
+static int io61_flush_locked(io61_file* f) {
     if (f->dirty && f->positioned) {
         return io61_flush_dirty_positioned(f);
     } else if (f->dirty) {
@@ -294,18 +312,25 @@ int io61_flush(io61_file* f) {
     }
 }
 
+// Public API: safe to call from any thread
+int io61_flush(io61_file* f) {
+    std::lock_guard<std::mutex> g(f->io_mu);
+    return io61_flush_locked(f);
+}
+
 
 // io61_seek(f, off)
 //    Changes the file pointer for file `f` to `off` bytes into the file.
 //    Returns 0 on success and -1 on failure.
 
 int io61_seek(io61_file* f, off_t off) {
+    std::lock_guard<std::mutex> g(f->io_mu);
 
     if (io61_maybe_unposition(f) == -1) {
         return -1;
     }
 
-    int r = io61_flush(f);
+    int r = io61_flush_locked(f);
     if (r == -1) {
         return -1;
     }
@@ -415,15 +440,20 @@ ssize_t io61_pread(io61_file* f, unsigned char* buf, size_t sz,
     
     // Acquire coarse-grained range lock
     io61_lock(f, off, sz, LOCK_EX);
+    
+    // protect io61 internal state before positioned I/O
+    std::lock_guard<std::mutex> g(f->io_mu);
 
      // positioned I/O requires read/write
      if (f->mode != O_RDWR) {
         errno = EINVAL;
+        io61_unlock(f, off, sz);
         return -1;
     }
 
     if (!f->positioned || off < f->tag || off >= f->end_tag) {
         if (io61_pfill(f, off) == -1) {
+            io61_unlock(f, off, sz);
             return -1;
         }
     }
@@ -431,7 +461,7 @@ ssize_t io61_pread(io61_file* f, unsigned char* buf, size_t sz,
     size_t nleft = f->end_tag - off;
     // if nothing left to read
     if (nleft == 0) {
-        // then EOF and return 0
+        io61_unlock(f, off, sz);
         return 0;
     }
     
@@ -459,8 +489,12 @@ ssize_t io61_pwrite(io61_file* f, const unsigned char* buf, size_t sz,
     // Acquire coarse-grained range lock
     io61_lock(f, off, sz, LOCK_EX);
 
+    // protect io61 internal state before positioned I/O
+    std::lock_guard<std::mutex> g(f->io_mu);
+
     if (!f->positioned || off < f->tag || off >= f->end_tag) {
         if (io61_pfill(f, off) == -1) {
+            io61_unlock(f, off, sz);
             return -1;
         }
     }
@@ -481,7 +515,7 @@ ssize_t io61_pwrite(io61_file* f, const unsigned char* buf, size_t sz,
 
 static int io61_pfill(io61_file* f, off_t off) {
     assert(f->mode == O_RDWR);
-    if (f->dirty && io61_flush(f) == -1) {
+    if (f->dirty && io61_flush_locked(f) == -1) {
         return -1;
     }
 
