@@ -433,43 +433,39 @@ static int io61_flush_clean(io61_file* f) {
 //    This function can only be called when `f` was opened in read/write
 //    more (O_RDWR).
 
-static int io61_pfill(io61_file* f, off_t off);
-
+static int io61_pfill_locked(io61_file* f, off_t off);
 ssize_t io61_pread(io61_file* f, unsigned char* buf, size_t sz,
                    off_t off) {
-    
-    // Acquire coarse-grained range lock
-    io61_lock(f, off, sz, LOCK_EX);
-    
-    // declaring ncopy before lock_guard scope
-    size_t ncopy = 0;
-    
-    {
-
-    // protect io61 internal state before positioned I/O
-    std::lock_guard<std::mutex> g(f->io_mu);
-
-     // positioned I/O requires read/write
-     if (f->mode != O_RDWR) {
-        io61_unlock(f, off, sz);
+    if (f->mode != O_RDWR) {
         errno = EINVAL;
         return -1;
     }
 
+    // 1. Acquire range lock for the region being accessed
+    if (io61_lock(f, off, sz, LOCK_EX) < 0) {
+        return -1;
+    }
+
+    // 2. Protect internal cache state
+    std::lock_guard<std::mutex> g(f->io_mu);
+
+    // Make sure cache contains the requested offset
     if (!f->positioned || off < f->tag || off >= f->end_tag) {
-        if (io61_pfill(f, off) == -1) {
+        if (io61_pfill_locked(f, off) == -1) {
             io61_unlock(f, off, sz);
             return -1;
         }
     }
-    // compute number of bytes left in the cache from offset off
+
     size_t nleft = f->end_tag - off;
-    ncopy = std::min(sz, nleft);
+    if (nleft == 0) {
+        io61_unlock(f, off, sz);
+        return 0;
+    }
+
+    size_t ncopy = std::min(sz, nleft);
     memcpy(buf, &f->cbuf[off - f->tag], ncopy);
 
-    }  // release io61 internal state lock
-
-    // Release range lock
     io61_unlock(f, off, sz);
     return ncopy;
 }
@@ -484,51 +480,62 @@ ssize_t io61_pread(io61_file* f, unsigned char* buf, size_t sz,
 
 ssize_t io61_pwrite(io61_file* f, const unsigned char* buf, size_t sz,
                     off_t off) {
-    
-    // Acquire coarse-grained range lock
-    io61_lock(f, off, sz, LOCK_EX);
+    if (f->mode != O_RDWR) {
+        errno = EINVAL;
+        return -1;
+    }
 
-    // protect io61 internal state before positioned I/O
+    // 1. Acquire range lock for the write region
+    if (io61_lock(f, off, sz, LOCK_EX) < 0) {
+        return -1;
+    }
+
+    // 2. Protect internal cache state
     std::lock_guard<std::mutex> g(f->io_mu);
 
     if (!f->positioned || off < f->tag || off >= f->end_tag) {
-        if (io61_pfill(f, off) == -1) {
+        if (io61_pfill_locked(f, off) == -1) {
             io61_unlock(f, off, sz);
             return -1;
         }
     }
+
     size_t nleft = f->end_tag - off;
     size_t ncopy = std::min(sz, nleft);
     memcpy(&f->cbuf[off - f->tag], buf, ncopy);
     f->dirty = true;
 
-    // Release range lock
     io61_unlock(f, off, sz);
     return ncopy;
 }
+
 
 
 // io61_pfill(f, off)
 //    Fill the single-slot cache with data including offset `off`.
 //    The handout code rounds `off` down to a multiple of 8192.
 
-static int io61_pfill(io61_file* f, off_t off) {
+static int io61_pfill_locked(io61_file* f, off_t off) {
     assert(f->mode == O_RDWR);
+
+    // If positioned cache is dirty, flush it under the same lock
     if (f->dirty && io61_flush_locked(f) == -1) {
         return -1;
     }
 
+    // Align `off` down to a multiple of 8192
     off = off - (off % 8192);
+
     ssize_t nr = pread(f->fd, f->cbuf, f->cbufsz, off);
     if (nr == -1) {
         return -1;
     }
+
     f->tag = off;
     f->end_tag = off + nr;
     f->positioned = true;
     return 0;
 }
-
 
 
 // FILE LOCKING FUNCTIONS
