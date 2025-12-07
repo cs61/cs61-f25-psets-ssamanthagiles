@@ -54,8 +54,8 @@ struct io61_file {
     std::condition_variable_any cv;
  
      // split file into regions for fine-grained locking
-     static const int NREG = 1024;
-     static const off_t REGION_SIZE = cbufsz;
+     static const int NREG = 16384;
+     static const off_t REGION_SIZE = 512;
  
     struct region_lock {
         unsigned locked = 0;        // 0 = unlocked, >0 = locked by `owner`
@@ -490,12 +490,12 @@ ssize_t io61_pwrite(io61_file* f, const unsigned char* buf, size_t sz,
         return -1;
     }
 
-    // 1. Acquire range lock for the write region
+    // acquire range lock for the write region
     if (io61_lock(f, off, sz, LOCK_EX) < 0) {
         return -1;
     }
 
-    // 2. Protect internal cache state
+    // protect internal cache state
     std::lock_guard<std::mutex> g(f->io_mu);
 
     bool window_ok =
