@@ -34,9 +34,11 @@ struct io61_file {
     int mode;
     bool seekable;
 
-    // Cache fields
+    // Single slot cache for the file 
     enum { cbufsz = 8192 };
     unsigned char cbuf[cbufsz];
+
+    // Where the buffer begins 
     off_t tag;
     off_t pos_tag;
     off_t end_tag;
