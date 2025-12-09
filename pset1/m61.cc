@@ -1,13 +1,15 @@
 #include "m61.hh"
-#include <cstdlib>
-#include <cstddef> 
+#include <cstdlib> 
 #include <cstring>
 #include <cstdio>
 #include <cinttypes>
 #include <cassert>
 #include <sys/mman.h>
 #include <map>
-
+#include <type_traits>
+#include <new>
+#include <cstddef>
+#include <stddef.h>
 
 struct m61_memory_buffer {
     char* buffer;
@@ -37,6 +39,7 @@ m61_memory_buffer::~m61_memory_buffer() {
 
 
 
+
 /// m61_malloc(sz, file, line)
 ///    Returns a pointer to `sz` bytes of freshly-allocated dynamic memory.
 ///    The memory is not initialized. If `sz == 0`, then m61_malloc may
@@ -63,6 +66,9 @@ struct allocationMetaData {
     const char* file; // File where allocation was made
     int line; // Line number where allocation was made
 };
+
+// Allocation history for debugging purposes
+static std::map<void*, allocationMetaData> allocation_history;
 
 // Map to track active allocations and their sizes
 static std::map<void*, allocationMetaData> active_allocations; 
@@ -247,6 +253,8 @@ void* m61_malloc(size_t sz, const char* file, int line) {
     gstats.active_size += original_size; 
     // Update metadata for this allocation in map active_allocations
     active_allocations[user_ptr] = {original_size, aligned_sz, blockStart, file, line};
+    allocation_history[user_ptr] = {original_size, aligned_sz, blockStart, file, line};
+
 
     // Update heap_min & heap_max
     uintptr_t new_first = (uintptr_t)user_ptr; // First address of the new allocation 
@@ -267,51 +275,65 @@ void* m61_malloc(size_t sz, const char* file, int line) {
 ///    Frees the memory allocation pointed to by `ptr`. If `ptr == nullptr`,
 ///    does nothing. Otherwise, `ptr` must point to a currently active
 ///    allocation returned by `m61_malloc`. The free was called at location
-///    `file`:`line`. 
+///    `file`:`line`.
 
 // Function that frees a previously allocated block of memory
 void m61_free(void* user_pointer, const char* file, int line) {
-    // Avoid uninitialized variable warnings
-    (void) file, (void) line;
+        // Avoid uninitialized variable warnings
+        (void) file, (void) line;
 
-    // Handle nullptr case
-    if (!user_pointer) {
-        return;
-    }
+        // Handle nullptr case
+        if (!user_pointer) {
+            return;
+        }
 
-    // Check if pointer is in active_allocations
-    auto active_alloc = active_allocations.find(user_pointer);
+        // Check if pointer is in active_allocations
+        auto active_alloc = active_allocations.find(user_pointer);
+        // Pointer is not in active_allocations
     if (active_alloc == active_allocations.end()) {
-        
-        // Check if pointer is in freed_allocations (first check for double free)
-        void* possible_front = (void*)((char*)user_pointer - guard_size);
-        auto freed_alloc = freed_allocations.find(possible_front);
-        if (freed_alloc != freed_allocations.end()) {
-            fprintf(stderr, "MEMORY BUG???: invalid free of pointer %p, double free\n", user_pointer);
+
+        auto hist = allocation_history.upper_bound(user_pointer);
+        if (hist != allocation_history.begin()) {
+            --hist;
+
+            char* base = (char*) hist->first;
+            char* end  = base + hist->second.original_size;
+
+            if (user_pointer == base) {
+                fprintf(stderr,
+                    "MEMORY BUG: %s:%d: invalid free of pointer %p, double free\n",
+                    file, line, user_pointer);
+                abort();
+            }
+
+            if ((char*) user_pointer > base && (char*) user_pointer < end) {
+                fprintf(stderr,
+                    "MEMORY BUG: %s:%d: invalid free of pointer %p, not allocated\n",
+                    file, line, user_pointer);
+
+                fprintf(stderr,
+                    "  %s:%d: %p is %td bytes inside a %zu byte region allocated here\n",
+                    hist->second.file,
+                    hist->second.line,
+                    user_pointer,
+                    (char*)user_pointer - base,
+                    hist->second.original_size);
+                abort();
+            }
+        }
+
+        uintptr_t addr = (uintptr_t) user_pointer;
+        if (addr < gstats.heap_min || addr > gstats.heap_max) {
+            fprintf(stderr,
+                "MEMORY BUG???: invalid free of pointer %p, not in heap\n",
+                user_pointer);
             abort();
         }
 
-        // Check to ensure pointer is within heap bounds
-        uintptr_t addr = (uintptr_t) user_pointer; // Convert ptr to uintptr_t for comparison
-        if (addr < gstats.heap_min || addr > gstats.heap_max) {
-            fprintf(stderr, "MEMORY BUG???: invalid free of pointer %p, not in heap\n", user_pointer);
-            abort(); // If not, return with error messae and then abort the program
-        }
-
-        // Check if pointer is within any active allocation (invalid free)
-        for (auto& keyValue:active_allocations) {
-            char* begin = (char*) keyValue.first;
-            char* end = begin + keyValue.second.aligned_size;
-            if ((char*) user_pointer > begin && (char*) user_pointer < end) {
-                fprintf(stderr, "MEMORY BUG: %s:%d: invalid free of pointer %p, not allocated\n", file, line, user_pointer);
-                abort(); 
-            }
-        }
-    
-        // Pointer is within heap bounds, so it must be a double free or invalid free
-        fprintf(stderr, "MEMORY BUG???: invalid free of pointer %p, double free\n", user_pointer);
+        fprintf(stderr,
+            "MEMORY BUG: %s:%d: invalid free of pointer %p, not allocated\n",
+            file, line, user_pointer);
         abort();
-        return;
     }
 
     // Retreive metadata for the active allocation
@@ -501,5 +523,11 @@ void m61_print_statistics() {
 ///    memory.
 
 void m61_print_leak_report() {
-    // Your code here.
+    for (auto& it : active_allocations) {
+        void* user_ptr = it.first;
+        allocationMetaData md = it.second;
+
+        printf("LEAK CHECK: %s:%d: allocated object %p with size %zu\n",
+               md.file, md.line, user_ptr, md.original_size);
+    }
 }

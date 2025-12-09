@@ -3,11 +3,19 @@ Author and collaborators
 
 Student
 -------
+(Your name.)
 Samantha Giles
 
 
 Collaborators
 -------------
+(List any other collaborators and describe help you got from other students
+in the class.)
+
+
+Citations
+---------
+(List any other sources consulted.)
 OH: 
     9.10, Winthrop Dhall 
     9.16, Virtual
