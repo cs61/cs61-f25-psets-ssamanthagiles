@@ -279,62 +279,62 @@ void* m61_malloc(size_t sz, const char* file, int line) {
 
 // Function that frees a previously allocated block of memory
 void m61_free(void* user_pointer, const char* file, int line) {
-        // Avoid uninitialized variable warnings
-        (void) file, (void) line;
+    // Avoid uninitialized variable warnings
+    (void) file, (void) line;
 
-        // Handle nullptr case
-        if (!user_pointer) {
-            return;
-        }
+    // Handle nullptr case
+    if (!user_pointer) {
+        return;
+    }
 
-        // Check if pointer is in active_allocations
-        auto active_alloc = active_allocations.find(user_pointer);
-        // Pointer is not in active_allocations
-    if (active_alloc == active_allocations.end()) {
+    // Check if pointer is in active_allocations
+    auto active_alloc = active_allocations.find(user_pointer);
+    // Pointer is not in active_allocations
+if (active_alloc == active_allocations.end()) {
 
-        auto hist = allocation_history.upper_bound(user_pointer);
-        if (hist != allocation_history.begin()) {
-            --hist;
+    auto hist = allocation_history.upper_bound(user_pointer);
+    if (hist != allocation_history.begin()) {
+        --hist;
 
-            char* base = (char*) hist->first;
-            char* end  = base + hist->second.original_size;
+        char* base = (char*) hist->first;
+        char* end  = base + hist->second.original_size;
 
-            if (user_pointer == base) {
-                fprintf(stderr,
-                    "MEMORY BUG: %s:%d: invalid free of pointer %p, double free\n",
-                    file, line, user_pointer);
-                abort();
-            }
-
-            if ((char*) user_pointer > base && (char*) user_pointer < end) {
-                fprintf(stderr,
-                    "MEMORY BUG: %s:%d: invalid free of pointer %p, not allocated\n",
-                    file, line, user_pointer);
-
-                fprintf(stderr,
-                    "  %s:%d: %p is %td bytes inside a %zu byte region allocated here\n",
-                    hist->second.file,
-                    hist->second.line,
-                    user_pointer,
-                    (char*)user_pointer - base,
-                    hist->second.original_size);
-                abort();
-            }
-        }
-
-        uintptr_t addr = (uintptr_t) user_pointer;
-        if (addr < gstats.heap_min || addr > gstats.heap_max) {
+        if (user_pointer == base) {
             fprintf(stderr,
-                "MEMORY BUG???: invalid free of pointer %p, not in heap\n",
-                user_pointer);
+                "MEMORY BUG: %s:%d: invalid free of pointer %p, double free\n",
+                file, line, user_pointer);
             abort();
         }
 
+        if ((char*) user_pointer > base && (char*) user_pointer < end) {
+            fprintf(stderr,
+                "MEMORY BUG: %s:%d: invalid free of pointer %p, not allocated\n",
+                file, line, user_pointer);
+
+            fprintf(stderr,
+                "  %s:%d: %p is %td bytes inside a %zu byte region allocated here\n",
+                hist->second.file,
+                hist->second.line,
+                user_pointer,
+                (char*)user_pointer - base,
+                hist->second.original_size);
+            abort();
+        }
+    }
+
+    uintptr_t addr = (uintptr_t) user_pointer;
+    if (addr < gstats.heap_min || addr > gstats.heap_max) {
         fprintf(stderr,
-            "MEMORY BUG: %s:%d: invalid free of pointer %p, not allocated\n",
-            file, line, user_pointer);
+            "MEMORY BUG???: invalid free of pointer %p, not in heap\n",
+            user_pointer);
         abort();
     }
+
+    fprintf(stderr,
+        "MEMORY BUG: %s:%d: invalid free of pointer %p, not allocated\n",
+        file, line, user_pointer);
+    abort();
+}
 
     // Retreive metadata for the active allocation
     allocationMetaData meta = active_alloc->second;
@@ -503,6 +503,66 @@ void* m61_calloc(size_t count, size_t sz, const char* file, int line) {
 
 m61_statistics m61_get_statistics() {
     return gstats;
+}
+
+
+/// m61_realloc(ptr, sz, file, line)
+///    Changes the size of the dynamic allocation pointed to by `ptr`
+///    to hold at least `sz` bytes. If the existing allocation cannot be
+///    enlarged, this function makes a new allocation, copies as much data
+///    as possible from the old allocation to the new, and returns a pointer
+///    to the new allocation. If `ptr` is `nullptr`, behaves like
+///    `m61_malloc(sz, file, line). `sz` must not be 0. If a required
+///    allocation fails, returns `nullptr` without freeing the original
+///    block.
+
+void* m61_realloc(void* ptr, size_t sz, const char* file, int line) {
+    // check if ptr is valid before allocating
+    if (!ptr) {
+        return m61_malloc(sz, file, line);
+    }
+
+    // j like in malloc, can't realloc size 0
+    // so need to allocate at least 1 byte
+    if (sz == 0) {
+        return m61_malloc(1, file, line);
+    }
+
+    // look up old allocation metadata
+    // it holds the iterator to the found allocation
+    auto it = active_allocations.find(ptr);
+
+    // if not held in active allocation map, can't be reallocated
+    if (it == active_allocations.end()) {
+        // so 
+        return nullptr;
+    }
+
+    // now can get old size from metadata
+    allocationMetaData old = it->second;
+    size_t old_size = old.original_size;
+
+    // if new size fits in existing block, j keep it
+    if (sz <= old_size) {
+        // shrink in place: update metadata but do NOT move pointer
+        it->second.original_size = sz;
+        return ptr;
+    }
+
+    // using malloc to allocate new block
+    void* new_ptr = m61_malloc(sz, file, line);
+    // handle if it fails
+    if (!new_ptr) {
+        return nullptr;
+    }
+
+    // copy only the data that originally existed
+    memcpy(new_ptr, ptr, old_size);
+
+    // now free the old block
+    m61_free(ptr, file, line);
+
+    return new_ptr;
 }
 
 

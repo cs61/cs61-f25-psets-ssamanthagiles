@@ -22,6 +22,11 @@ void m61_free(void* ptr, const char* file = __builtin_FILE(), int line = __built
 ///    is initialized to zero.
 void* m61_calloc(size_t count, size_t sz, const char* file = __builtin_FILE(), int line = __builtin_LINE());
 
+// for extra credit (realloc reallocates a previously allocated block)
+void* m61_realloc(void* ptr, size_t sz, const char* file = __builtin_FILE(), int line = __builtin_LINE());
+
+
+
 
 /// m61_statistics
 ///    Structure tracking memory statistics.
