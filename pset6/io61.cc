@@ -27,52 +27,73 @@
 // polling = repeatedly checking if a condition is true
 // blocking = thread sleeps until condition is true
 
+// Received feedback that my code would be more readable with fewer comments 
+// trying that out this problem set :) 
 
 // io61_file
-struct io61_file {
-    int fd;
-    int mode;
-    bool seekable;
 
-    // Single slot cache for the file 
+// foward decs for fill functions 
+static int io61_pfill_locked(io61_file* f, off_t off);
+static int io61_fill(io61_file* f);
+
+// forward decs for locking functions
+int io61_try_lock(io61_file* f, off_t off, off_t len, int locktype);
+int io61_lock(io61_file* f, off_t off, off_t len, int locktype);
+int io61_unlock(io61_file* f, off_t off, off_t len);
+
+// forward decs for flush function
+static int io61_flush_locked(io61_file* f);
+static int io61_flush_dirty(io61_file* f);
+static int io61_flush_dirty_positioned(io61_file* f);
+static int io61_flush_clean(io61_file* f);
+
+
+// holds the state of an open file
+// includes file descriptor, mode, cache, and region locks
+struct io61_file {
+    int fd;         // file descriptor
+    int mode;       // O_RDONLY, O_WRONLY, or O_RDWR
+    bool seekable;  // is this file seekable?
+
+    // Single-slot cache
     enum { cbufsz = 8192 };
     unsigned char cbuf[cbufsz];
 
-    // Where the buffer begins 
-    off_t tag;
-    off_t pos_tag;
-    off_t end_tag;
+    off_t tag;      // offset of first character in `cbuf`
+    off_t pos_tag;  // next offset to read or write (non-positioned mode)
+    off_t end_tag;  // offset one past last valid character in `cbuf`
 
     // Positioned mode
-    bool positioned;
-    bool dirty;
+    bool positioned;       // has cache been written?
+    bool dirty;  // is cache in positioned mode?
 
-    // coarse-grained lock for normal I/O (read/write/flush/seek)
+    // from Problem Set 6 hints section
+    // mutex for protecting the io61_file state
+    // so only one thread can access the file    
     std::mutex io_mu;
-    
-    // protects all range-lock metadata
     std::mutex m;
-    // used to sleep/wake threads waiting on locks
     std::condition_variable_any cv;
- 
-     // split file into regions for fine-grained locking
-     static const int NREG = 16384;
-     static const off_t REGION_SIZE = 512;
- 
+    
+    // 16384 regions for locking, 512 bytes each
+    static const int NREG = 16384;
+    static const off_t REGION_SIZE = 512;
+
+    // stores which regions are locked & who locks them
     struct region_lock {
-        unsigned locked = 0;        // 0 = unlocked, >0 = locked by `owner`
-        std::thread::id owner = std::thread::id();  // empty "no thread";      // which thread owns this region
+        unsigned locked = 0;       
+        std::thread::id owner = std::thread::id();  
      };
  
      region_lock reg[NREG];          // lock state for each region
  };
 
-// ragelock struct to represent a range lock
+// converts a byte offset into an index into reg[]
 static int file_region(off_t off) {
     return off / io61_file::REGION_SIZE;
 }
 
 // overlap checking helper function
+// from Problem Set 6 hints section
 bool may_overlap_with_other_lock(io61_file* f, off_t off, off_t len) {
     std::thread::id me = std::this_thread::get_id();
 
@@ -85,18 +106,14 @@ bool may_overlap_with_other_lock(io61_file* f, off_t off, off_t len) {
     for (int ri = rstart; ri <= rend; ++ri) {
         if (f->reg[ri].locked > 0 &&
             f->reg[ri].owner != me) {
-            return true;   // another thread owns this region
+            return true; // another thread owns this region
         }
     }
     return false;
 }
 
 
-
-// forward dec of flush helper function
-static int io61_flush_dirty_positioned(io61_file* f);
-
-// switch from positioned to non-positioned mode
+// IF applicable, drops positioned cache and returns based on current state
 static int io61_maybe_unposition(io61_file* f) {
     if (!f->positioned) {
         return 0;
@@ -113,7 +130,7 @@ static int io61_maybe_unposition(io61_file* f) {
         }
     }
 
-    // drop positioned cache; start with an empty non-positioned cache
+    // after dropping, reset the cache state
     f->tag = f->end_tag = f->pos_tag;
     f->positioned = false;
     f->dirty = false;
@@ -121,20 +138,14 @@ static int io61_maybe_unposition(io61_file* f) {
     return 0;
 }
 
-// Forward declarations for locking functions
-int io61_try_lock(io61_file* f, off_t off, off_t len, int locktype);
-int io61_lock(io61_file* f, off_t off, off_t len, int locktype);
-int io61_unlock(io61_file* f, off_t off, off_t len);
-
-// forward dec for flush function
-static int io61_flush_locked(io61_file* f);
-
 
 // io61_fdopen(fd, mode)
 //    Returns a new io61_file for file descriptor `fd`. `mode` is either
 //    O_RDONLY for a read-only file, O_WRONLY for a write-only file,
 //    or O_RDWR for a read/write file.
 
+// opens a file descriptor and updates its cache state 
+// runs io61_maybe_unposition to ensure the cache is in a good state before returning
 io61_file* io61_fdopen(int fd, int mode) {
     assert(fd >= 0);
     assert((mode & O_APPEND) == 0);
@@ -173,8 +184,6 @@ int io61_close(io61_file* f) {
 // io61_readc(f)
 //    Reads a single (unsigned) byte from `f` and returns it. Returns EOF,
 //    which equals -1, on end of file or error.
-
-static int io61_fill(io61_file* f);
 
 int io61_readc(io61_file* f) {
 
@@ -296,14 +305,8 @@ ssize_t io61_write(io61_file* f, const unsigned char* buf, size_t sz) {
 //    If `f` was opened read-only and is seekable, `io61_flush(f)` drops any
 //    data cached for reading and seeks to the logical file position.
 
-// forward decs for flush helper functions
-static int io61_flush_dirty(io61_file* f);
-static int io61_flush_dirty_positioned(io61_file* f);
-static int io61_flush_clean(io61_file* f);
-static int io61_flush_locked(io61_file* f);
-
-
-// Internal helper: assumes caller already holds f->io_mu
+// caller must alr hold the io_mu lock
+// avoids deadlocks when flush is called with io_mu held
 static int io61_flush_locked(io61_file* f) {
     if (f->dirty && f->positioned) {
         return io61_flush_dirty_positioned(f);
@@ -314,7 +317,7 @@ static int io61_flush_locked(io61_file* f) {
     }
 }
 
-// Public API: safe to call from any thread
+// public flush wrapper so any thread can safely flush 
 int io61_flush(io61_file* f) {
     std::lock_guard<std::mutex> g(f->io_mu);
     return io61_flush_locked(f);
@@ -435,7 +438,7 @@ static int io61_flush_clean(io61_file* f) {
 //    This function can only be called when `f` was opened in read/write
 //    more (O_RDWR).
 
-static int io61_pfill_locked(io61_file* f, off_t off);
+
 ssize_t io61_pread(io61_file* f, unsigned char* buf, size_t sz,
                    off_t off) {
     if (f->mode != O_RDWR) {
@@ -443,12 +446,10 @@ ssize_t io61_pread(io61_file* f, unsigned char* buf, size_t sz,
         return -1;
     }
 
-    // 1. Acquire range lock for the region being accessed
     if (io61_lock(f, off, sz, LOCK_EX) < 0) {
         return -1;
     }
 
-    // 2. Protect internal cache state
     std::lock_guard<std::mutex> g(f->io_mu);
 
     bool window_ok =
@@ -568,12 +569,8 @@ static int io61_pfill_locked(io61_file* f, off_t off) {
 //    always lock nonoverlapping ranges.
 
 int io61_try_lock(io61_file* f, off_t off, off_t len, int locktype) {
-    // off and len holds the range to be locked
-    // so checking if the range is valid
     
-    // if the length is 0
     if (len == 0) {
-        // nothing to lock, so return 0
         return 0;
     }
 
@@ -585,7 +582,6 @@ int io61_try_lock(io61_file* f, off_t off, off_t len, int locktype) {
     
     int r = file_region(off);
 
-    // Clamp to valid bounds
     if (r < 0) {
         r = 0;
     } 
@@ -595,13 +591,14 @@ int io61_try_lock(io61_file* f, off_t off, off_t len, int locktype) {
     }
 
     io61_file::region_lock& reg = f->reg[r];
-    // If another thread owns it, fail immediately
+
+    // if another thread owns it, fail immediately
     if (reg.locked > 0 && reg.owner != me) {
         errno = EAGAIN;
         return -1;
     }
 
-    // Otherwise acquire it
+    // if not can aquire
     if (reg.owner == me) {
         reg.locked++;
     } else {
@@ -665,6 +662,8 @@ int io61_unlock(io61_file* f, off_t off, off_t len) {
         }
     }
 
+    // after releasing the lock, notify all waiting threads
+    // so they can try to acquire the lock again
     f->cv.notify_all();
     return 0;
 }

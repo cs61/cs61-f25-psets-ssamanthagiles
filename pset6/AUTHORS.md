@@ -3,17 +3,15 @@ Author and collaborators
 
 Primary student
 ---------------
-(Your name.)
-
+Samantha Giles
 
 Collaborators
 -------------
-(List any other collaborators and describe help you got from other students
-in the class.)
-
+Faisal
 
 Citations
 ---------
-(List any other sources consulted. Include shareable links to sessions with
-generative AI tools, if any, and describe any interactions with IDE-based
-coding assistants such as Claude Code or GitHub Copilot.)
+Used github copilot to complete the problem set. 
+Used this ed comments reasoning/logic to help me pass san1 check
+    https://edstem.org/us/courses/81197/discussion/7419654
+Used problem set6 hints (https://cs61.seas.harvard.edu/site/2025/FlockchainHints/) to help finish pset

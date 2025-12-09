@@ -7,6 +7,8 @@ collaborators, in `AUTHORS.md`.
 
 Grading notes (if any)
 ----------------------
+Received feedback that my code would be more readable with fewer comments 
+trying that out this problem set :) 
 
 
 
