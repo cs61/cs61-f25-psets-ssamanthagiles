@@ -12,3 +12,4 @@ Grading notes (if any)
 
 Extra credit attempted (if any)
 -------------------------------
+Completed intermediate check in (going to OH before 10/13)

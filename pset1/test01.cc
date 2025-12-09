@@ -1,10 +1,14 @@
 #include "m61.hh"
+#include <cstring> // For memset
 #include <cstdio>
 // Check that statistics are initially zero.
 
+
 int main() {
-    m61_print_statistics();
+    m61_print_statistics(); // Call the function to print memory statistics
 }
+
+
 
 // Lines starting with "//!" define the expected output for this test.
 

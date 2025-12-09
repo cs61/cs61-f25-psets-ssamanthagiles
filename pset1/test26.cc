@@ -15,22 +15,25 @@ int main() {
     const size_t nmax = 10000;
     unsigned char* ptrs[nmax];
     size_t n = 0;
+    // Allocating whole heap (8 mb buffer) 
+    // Calling malloc repeatedly to allocate 850 bytes each time at which point buffer will be full
     while (n != nmax) {
         ptrs[n] = (unsigned char*) m61_malloc(850);
         if (!ptrs[n]) {
             break;
-        }
+        } 
         memset(ptrs[n], n & 255, 10);
         ++n;
     }
 
-    if (n > 0) {
-        size_t f = n / 2;
-        check_contents(ptrs[f], f & 255);
-        m61_free(ptrs[f]);
+    if (n > 0) { // Succesfully allocated at least one block
+        size_t f = n / 2; // Half as many allocations
+        check_contents(ptrs[f], f & 255); // ptrs[f] holds all the malloc calls, middle allocation
+        m61_free(ptrs[f]); // Freeing the block
 
-        ptrs[f] = (unsigned char*) m61_malloc(850);
-        assert(ptrs[f]);
+        // Making sure we can reuse freed blocks 
+        ptrs[f] = (unsigned char*) m61_malloc(850); // And then mallocing again
+        assert(ptrs[f]); // Checking that the allcoation worked
         memset(ptrs[f], f & 255, 10);
     }
 

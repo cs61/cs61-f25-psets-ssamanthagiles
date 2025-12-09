@@ -5,10 +5,10 @@
 // Check for memory reuse: at most one active allocation.
 
 int main() {
-    for (int i = 0; i != 10000; ++i) {
-        void* ptr = m61_malloc(1000);
-        assert(ptr);
-        m61_free(ptr);
+    for (int i = 0; i != 10000; ++i) { 
+        void* ptr = m61_malloc(1000); // Allocate 10000 bytes of memory using the m61_malloc function into the pointer ptr 
+        assert(ptr); // Assert (test) allocation is successful 
+        m61_free(ptr); // Free the memory
     }
     m61_print_statistics();
 }

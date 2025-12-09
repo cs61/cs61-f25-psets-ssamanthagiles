@@ -1,0 +1,12 @@
+#layout asm
+b phase1 
+b phase2
+b phase3
+b phase4
+b phase5
+b phase6
+b phase7
+b *0x4018d5
+b *0x401920
+b *0x4019a8
+b explode_bomb

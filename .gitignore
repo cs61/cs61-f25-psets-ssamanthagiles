@@ -45,3 +45,5 @@ tags
 tags.*
 typescript
 vgcore*
+pset4/trace-*.txt
+strace.out
