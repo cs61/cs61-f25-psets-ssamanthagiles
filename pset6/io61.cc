@@ -82,6 +82,10 @@ struct io61_file {
     struct region_lock {
         unsigned locked = 0;       
         std::thread::id owner = std::thread::id();  
+
+        // starting ec
+        bool exclusive = false;// true if an exclusive writer holds this region
+        int readers = 0; // number of shared read locks
      };
  
      region_lock reg[NREG];          // lock state for each region
@@ -573,6 +577,13 @@ int io61_try_lock(io61_file* f, off_t off, off_t len, int locktype) {
     if (len == 0) {
         return 0;
     }
+
+    if (locktype == LOCK_SH) {
+        // TODO: shared lock implementation (extra credit)
+        errno = EAGAIN;
+        return -1;
+    }
+    
 
     // LOCK_EX means exclusive lock (no other thread can hold the lock at the same time)
     assert(locktype == LOCK_EX);
