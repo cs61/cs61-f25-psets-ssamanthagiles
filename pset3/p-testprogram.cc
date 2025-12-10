@@ -9,22 +9,28 @@ void process_main() {
 
     // test uptime
     long up1 = sys_uptime();
+    // if uptime is negative, something is wrong
     assert(up1 >= 0);
 
     long up1b = sys_uptime();
+    // make sure uptime is non-decreasing !
     assert(up1b >= up1);
 
     // test sleep
     sys_sleep(50);
+    // after sleeping for 50 ticks, uptime should have increased by at least 50
     long up2 = sys_uptime();
+    // check that at least 50 ticks have passed
     assert(up2 - up1 >= 50);
 
-    // test random
+    // test random number generation !!
     long rvals[5];
+    // testing if multiple calls give different results
     for (int i = 0; i < 5; i++) {
+        // store random values
         rvals[i] = sys_random();
     }
-
+    // check that at least one value is different
     bool changed = false;
     for (int i = 1; i < 5; i++) {
         if (rvals[i] != rvals[0]) {
@@ -32,6 +38,7 @@ void process_main() {
             break;
         }
     }
+    // will fail if all random values are the same
     assert(changed);
 
     // test page_alloc and page_free
