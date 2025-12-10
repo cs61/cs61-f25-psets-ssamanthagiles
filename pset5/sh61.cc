@@ -28,6 +28,58 @@ void sigint_handler(int) {
         kill(-fg_pgid, SIGINT);   // kill whole foreground pipeline
     }
 }
+
+// helper: apply a single redirection if filename is not empty
+int apply_redirection(const std::string& file, int target_fd) {
+    if (file.empty()) {
+        return 0;   // nothing to do
+    }
+
+    bool append = false;
+    std::string fn = file;
+
+    if (file[0] == '+') {
+        append = true;
+        fn = file.substr(1);
+    }
+
+    int flags = O_WRONLY | O_CREAT | (target_fd == STDIN_FILENO ? O_RDONLY : (append ? O_APPEND : O_TRUNC));
+    if (target_fd == STDIN_FILENO) {
+        flags = O_RDONLY;
+    }
+
+    int fd = open(fn.c_str(), flags, 0666);
+    if (fd < 0) {
+        perror(fn.c_str());
+        return -1;
+    }
+
+    if (dup2(fd, target_fd) < 0) {
+        perror("dup2");
+        close(fd);
+        return -1;
+    }
+
+    close(fd);
+    return 0;
+}
+
+struct SavedFDs {
+    int in, out, err;
+};
+
+SavedFDs save_fds() {
+    return { dup(STDIN_FILENO), dup(STDOUT_FILENO), dup(STDERR_FILENO) };
+}
+
+void restore_fds(const SavedFDs& s) {
+    dup2(s.in,  STDIN_FILENO);
+    dup2(s.out, STDOUT_FILENO);
+    dup2(s.err, STDERR_FILENO);
+    close(s.in);
+    close(s.out);
+    close(s.err);
+}
     
 
 // command structure 
@@ -239,149 +291,46 @@ int run_command(command_parser cmdpar) {
     // phase 8, handle cd before running command
     // cd = change directory
     // as long as there are arguments in the command and first argument is "cd"
+    // phase 8, handle cd before running command
     if (c->args.size() > 0 && c->args[0] == "cd") {
 
         // save original file descriptors to restore later
-        // using dup syscall
-        int old_stdin  = dup(STDIN_FILENO);
-        int old_stdout = dup(STDOUT_FILENO);
-        int old_stderr = dup(STDERR_FILENO);
+        SavedFDs saved = save_fds();
 
-        // check for redirections before executing cd command
+        // apply input/output/error redirections
+        if (apply_redirection(c->infile, STDIN_FILENO) < 0 ||
+            apply_redirection(c->outfile, STDOUT_FILENO) < 0 ||
+            apply_redirection(c->errfile, STDERR_FILENO) < 0) {
 
-        // if there is an input redirection
-        if (!c->infile.empty()) {
-            // open infile in read only mode
-            int fd = open(c->infile.c_str(), O_RDONLY);
-            // if opening file descriptor fails
-            if (fd < 0) {
-                // print error
-                perror(c->infile.c_str());
-                // duplicate old fds to restore
-                dup2(old_stderr, STDERR_FILENO);
-                dup2(old_stdout, STDOUT_FILENO);
-                dup2(old_stdin,  STDIN_FILENO);
-                // after close restored fds
-                close(old_stderr);
-                close(old_stdout);
-                close(old_stdin);
-                // need to delete command struct bc created dynamically on heap
-                delete c;
-                // indicate failure bc opening infile failed
-                return 1;
-            }
-            // else, opening infile succeeded
-            // redirect stdin to infile
-            dup2(fd, STDIN_FILENO);
-            // now close after handling infile redirection
-            close(fd);
+            // if any redirection fails, restore fds and return
+            restore_fds(saved);
+            delete c;
+            return 1;
         }
 
-        // if there is an output redirection
-        if (!c->outfile.empty()) {
-            // open outfile in write only mode, create if doesn't exist, truncate if exists
-            int fd = open(c->outfile.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0666);
-            // if opening file descriptor fails
-            if (fd < 0) {
-                // print error
-                perror(c->outfile.c_str());
-                // duplicate old fds to restore
-                dup2(old_stderr, STDERR_FILENO);
-                dup2(old_stdout, STDOUT_FILENO);
-                dup2(old_stdin,  STDIN_FILENO);
-                // after close restored fds
-                close(old_stderr);
-                close(old_stdout);
-                close(old_stdin);
-                // delete command struct bc created dynamically on heap
-                delete c;
-                // indicate failure bc opening outfile failed
-                return 1;
-            }
-            // else, opening outfile succeeded
-            // redirect stdout to outfile
-            dup2(fd, STDOUT_FILENO);
-            // now close after handling outfile redirection
-            close(fd);
-        }
-
-        // if there is an error redirection
-        if (!c->errfile.empty()) {
-            // open errfile in write only mode, create if doesn't exist, truncate if exists
-            int fd = open(c->errfile.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0666);
-            // if opening file descriptor fails
-            if (fd < 0) {
-                // print error
-                perror(c->errfile.c_str());
-                // duplicate old fds to restore
-                dup2(old_stderr, STDERR_FILENO);
-                dup2(old_stdout, STDOUT_FILENO);
-                dup2(old_stdin,  STDIN_FILENO);
-                // after close restored fds
-                close(old_stderr);
-                close(old_stdout);
-                close(old_stdin);
-                // delete command struct bc created dynamically on heap
-                delete c;
-                // indicate failure bc opening errfile failed
-                return 1;
-            }
-            // else, opening errfile succeeded
-            // redirect stderr to errfile
-            dup2(fd, STDERR_FILENO);
-            // now close after handling errfile redirection
-            close(fd);
-        }
-
-        // now can execute cd command
-        // path holds the directory to change to
+        // determine cd target
         const char* path = nullptr;
-
-        // if only "cd" with no arguments
         if (c->args.size() == 1) {
-            // get HOME environment variable for path
-            // bc cd with no args goes to home directory
             path = getenv("HOME");
-            // if HOME environment variable not set
-            // then default to current directory "."
             if (!path) path = ".";
-        // or there were arguments after "cd"
         } else {
-            // so set path to the first argument after "cd"
             path = c->args[1].c_str();
         }
 
-        // rc holds return code of chdir syscall
-        // chdir changes the current working directory of the process
+        // attempt chdir
         int rc = 0;
-
-        // after determining path, attempt to change directory
-
-        // if chdir fails (returns -1)
         if (chdir(path) < 0) {
-            // print error for changing directory
             perror(path);
-            // indicate failure
             rc = 1;
         }
 
-        // else chdir succeeded, rc remains 0
-        
-        // restore original file descriptors after cd command
-        // using dup2 syscall
-        dup2(old_stderr, STDERR_FILENO);
-        dup2(old_stdout, STDOUT_FILENO);
-        dup2(old_stdin,  STDIN_FILENO);
-        // after close restored fds
-        close(old_stderr);
-        close(old_stdout);
-        close(old_stdin);
+        // restore original file descriptors
+        restore_fds(saved);
 
-        // need to delete command struct bc created dynamically on heap
         delete c;
-        // return return code of cd command
         return rc;
     }
+
 
     // run the command in a child process
     c->run();
