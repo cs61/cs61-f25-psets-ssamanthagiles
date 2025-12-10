@@ -681,12 +681,11 @@ static int syscall_fork() {
     // sleep
     case SYSCALL_SLEEP: {
         unsigned long duration = regs->reg_rdi;
-        unsigned long start = ticks.load();
-        while (ticks.load() - start < duration) {
-            schedule(); // yield until enough ticks have passed
-        }
-        return 0;
+        current->waketime = ticks + duration;
+        current->state = P_BLOCKED;
+        schedule();   // will not return
     }
+    
     
     // random
     case SYSCALL_RANDOM:
@@ -817,6 +816,13 @@ void schedule() {
     pid_t pid = current->pid;
     for (unsigned spins = 1; true; ++spins) {
         pid = (pid + 1) % MAXNPROC;
+
+        // wake sleeping/blocked processes whose time has come
+        if (ptable[pid].state == P_BLOCKED &&
+            ticks >= ptable[pid].waketime) {
+            ptable[pid].state = P_RUNNABLE;
+        }
+
         if (ptable[pid].state == P_RUNNABLE) {
             run(&ptable[pid]);
         }
