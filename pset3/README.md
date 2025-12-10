@@ -7,10 +7,10 @@ collaborators, in `AUTHORS.md`.
 
 Grading notes (if any)
 ----------------------
-The output of my test program may look a bit uncoordinated because the kernel’s memory-dump and tracing messages print at the same time as my user-level output. This causes some lines to appear out of order or mixed together, even though the system calls are working.
 
 
 Extra credit attempted (if any)
 -------------------------------
 Completed intermediate check in (going to OH before 10/13)
-For extra credit, I added a bunch of optional syscalls to my kernel and wrote my own test program to make sure they all worked. I got sys_uptime, sys_sleep, sys_random, sys_page_alloc, sys_page_free, and sys_kill all running, and then I made a custom file (p-testprogram.cc) that prints out uptime before and after sleeping, generates random numbers, tries allocating and freeing a page, and even tests killing another process.
+
+For extra credit, I implemented several system calls in my WeensyOS kernel and wrote a custom user test program (p-testprogram.cc) to verify each one. My program calls sys_uptime, which returns the number of ticks since boot; sys_sleep, which pauses the calling process for a specified number of ticks; and sys_random, which provides a kernel-generated pseudorandom value. I also implemented sys_page_alloc and sys_page_free to test user-level page management by allocating a page at a valid virtual address, detecting double-allocations, and confirming correct freeing behavior. Finally, I added sys_kill, which attempts to terminate a process by PID and correctly rejects invalid or self-targeted kill attempts. To run my test, you can rebuild and launch the OS in console mode with make clean, make, and make run-console; my program runs automatically as the first process and prints its results on startup. 
