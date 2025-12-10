@@ -1,5 +1,5 @@
 #include "m61.hh"
-#include <cstdlib> 
+#include <cstdlib>
 #include <cstring>
 #include <cstdio>
 #include <cinttypes>
@@ -10,25 +10,24 @@
 #include <new>
 #include <cstddef>
 #include <stddef.h>
+#include <vector>
 
+// each buffer is an 8 MiB chunk that m61_malloc can draw from
 struct m61_memory_buffer {
     char* buffer;
     size_t pos = 0;
-    size_t size = 8 << 20; /* 8 MiB */
+    size_t size = 8 << 20;   // 8 MiB
 
     m61_memory_buffer();
     ~m61_memory_buffer();
 };
 
-static m61_memory_buffer default_buffer;
-
-
 m61_memory_buffer::m61_memory_buffer() {
-    void* buf = mmap(nullptr,    // Place the buffer at a random address
-        this->size,              // Buffer should be 8 MiB big
-        PROT_WRITE,              // We want to read and write the buffer
-        MAP_ANON | MAP_PRIVATE, -1, 0);
-                                 // We want memory freshly allocated by the OS
+    void* buf = mmap(nullptr,          // random address
+                     this->size,       // 8 MiB region
+                     PROT_WRITE,       // readable + writable
+                     MAP_ANON | MAP_PRIVATE,
+                     -1, 0);
     assert(buf != MAP_FAILED);
     this->buffer = (char*) buf;
 }
@@ -37,537 +36,571 @@ m61_memory_buffer::~m61_memory_buffer() {
     munmap(this->buffer, this->size);
 }
 
+// all heap space lives in these buffers (extra credit: multiple buffers)
+static std::vector<m61_memory_buffer*> buffers;
 
-
-
-/// m61_malloc(sz, file, line)
-///    Returns a pointer to `sz` bytes of freshly-allocated dynamic memory.
-///    The memory is not initialized. If `sz == 0`, then m61_malloc may
-///    return either `nullptr` or a pointer to a unique allocation.
-///    The allocation request was made at source code location `file`:`line`.
-
-// Global statistics about memory allocations
-static m61_statistics gstats = { 
-    .nactive = 0, // Number of active allocations (not yet freed)
-    .active_size = 0, // Total bytes in active allocations
-    .ntotal = 0, // Total of allocation requests
-    .total_size = 0, // Total bytes of all allocation requests
-    .nfail = 0, // Number of failed allocation requests
-    .fail_size = 0, // Total size of failed allocation requests
-    .heap_min = 0, // Smallest allocated address
-    .heap_max = 0 // Largest allocated address
+// global statistics for the allocator
+static m61_statistics gstats = {
+    .nactive = 0,
+    .active_size = 0,
+    .ntotal = 0,
+    .total_size = 0,
+    .nfail = 0,
+    .fail_size = 0,
+    .heap_min = 0,
+    .heap_max = 0
 };
 
-// Struct to hold metadata for each allocation
+// per-allocation metadata
 struct allocationMetaData {
-    size_t original_size; // Original size requested by the user
-    size_t aligned_size;  // Size after alignment
-    void* block_start; // Pointer to the start of the allocated block (including guard regions)
-    const char* file; // File where allocation was made
-    int line; // Line number where allocation was made
+    size_t original_size;       // bytes requested by user
+    size_t aligned_size;        // size protected with guards
+    void*  block_start;         // pointer to front guard
+    const char* file;           // where the allocation was made
+    int line;
+
+    m61_memory_buffer* parent_buffer; // which buffer this lives in
+    size_t total_span; //actual bytes consumed in buffer
 };
 
-// Allocation history for debugging purposes
+// history of every allocation ever seen (for double-free / “inside region” errors)
 static std::map<void*, allocationMetaData> allocation_history;
 
-// Map to track active allocations and their sizes
-static std::map<void*, allocationMetaData> active_allocations; 
+// currently-active allocations
+static std::map<void*, allocationMetaData> active_allocations;
 
-// Map to track freed allocations and their sizes for reuse
-static std::map<void*, allocationMetaData> freed_allocations; 
+// per-buffer free lists: each buffer gets its own map of freed blocks
+static std::map<m61_memory_buffer*, std::map<void*, allocationMetaData> > freed_lists;
 
-// Variable guard_size stores the size of guard regions using function std::max_align_t to ensure proper alignment
-static const size_t guard_size = alignof(std::max_align_t); 
+// guards and padding use this size and pattern
+// max_align_t is chosen so any type is safely aligned inside the block
+static const size_t guard_size = alignof(std::max_align_t);
+static const unsigned char guard_pattern = 0xEF;
 
-// Variable guard_pattern stores the pattern (0xEF) used to initialize guard regions around allocated memory
-static const unsigned char guard_pattern = 0xEF; 
+// one-time initialization of the first buffer
+static bool buffers_initialized = false;
+static void ensure_initial_buffer() {
+    if (!buffers_initialized) {
+        buffers.push_back(new m61_memory_buffer());
+        buffers_initialized = true;
+    }
+}
 
-// Function to find a freed block of memory that can be reused for a new allocation request
-static bool m61_find_free_space(size_t sz, void** reused_user_ptr, allocationMetaData* old_md){ 
-   
-    // Iterate through freed_allocations map to find a freed block that will fit
+// helper: find which buffer contains a raw pointer (used as a fallback sanity check)
+static m61_memory_buffer* find_buffer_for(void* p) {
+    for (auto* buf : buffers) {
+        char* start = buf->buffer;
+        char* end   = buf->buffer + buf->size;
+        if ((char*) p >= start && (char*) p < end) {
+            return buf;
+        }
+    }
+    return nullptr;
+}
+
+// find a freed block in `buf` that can satisfy an aligned request of size `sz`
+// if found, returns true and fills `reused_user_ptr` and `old_md`
+static bool m61_find_free_space(m61_memory_buffer* buf,
+                                size_t sz,
+                                void** reused_user_ptr,
+                                allocationMetaData* old_md) {
+    auto& freed_allocations = freed_lists[buf];
+
     for (auto it = freed_allocations.begin(); it != freed_allocations.end(); ++it) {
-        
-        // Variable that stores the metadata of the current block being looked at
-        allocationMetaData m = it->second; 
-        // Variable that stores the aligned size of the current block being looked at
-        size_t available_bytes = m.aligned_size; 
-        // Check if the reused freed block has enough space to satisfy the allocation request
-        if (available_bytes >= sz){
-            char* block_start = (char*) it->first; // Starting address of the current block being looked at
-            char* user_ptr = block_start + guard_size; // Starting address of the user-accessible memory (taking into account guard size)
-            
-            // Check if the block can be reused as is (without splitting) -> there are 2 guard regions so multiply guard_size by 2
-            if (available_bytes == sz || available_bytes < sz + 2 * guard_size + 1){
-                memset(block_start, guard_pattern, guard_size); // Set block_start of reused block to guard pattern (front guard)
-                memset(user_ptr + available_bytes, guard_pattern, guard_size); // Set user_ptr + sz of the reused block (end of block) to guard pattern (back guard)
-                *reused_user_ptr = user_ptr; // Update the pointer at reused_user_ptr to point to the memory that now takes into account guard size
-                *old_md = {0, sz, block_start, nullptr, 0}; // Update old_md to store the original and aligned sizes of the reused block
-                freed_allocations.erase(it); // Remove the block from freed_allocations since it is being reused
-                return true; // Return true becasue a suitable block was found and reused
-            } 
-        
-            // Variable remainder_size stores the size of the remainder block if the reused block is split
+        allocationMetaData m = it->second;
+        size_t available_bytes = m.aligned_size;
+
+        if (available_bytes >= sz) {
+            char* block_start = (char*) it->first;   // front guard
+            char* user_ptr = block_start + guard_size;
+
+            // case 1: reuse the whole block (no usable remainder)
+            // if the leftover space would be too small to hold guards + payload,
+            // just treat the whole range as the new block
+            if (available_bytes == sz
+                || available_bytes < sz + 2 * guard_size + 1) {
+
+                // rewrite guards so this block behaves like a fresh allocation
+                memset(block_start, guard_pattern, guard_size);
+                memset(user_ptr + sz, guard_pattern, guard_size);
+
+                *reused_user_ptr = user_ptr;
+
+                // keep aligned_size = available_bytes,
+                // since using the entire block as the active region
+                *old_md = { 0, sz, block_start, nullptr, 0, buf, 0 };
+
+                freed_allocations.erase(it);
+                return true;
+            }
+
+            // case 2: split the block into [new block] + [remainder]
             size_t remainder_size = available_bytes - sz - 2 * guard_size;
 
-            // Split the reused block if it is large enough
-            char* back_guard_reused = user_ptr + sz; // Pointer to the back guard of reused block
-            char* remainder_start = back_guard_reused + guard_size; // Pointer to the start of the remainder block
-            char* remainder_user_ptr = remainder_start + guard_size; // Pointer to the start of the reused memory in remainder block that is large enough for future allocations
-            char* remainder_back_guard = remainder_user_ptr + remainder_size; // Pointer to the back guard of the remainder block
-            
-            memset(block_start, guard_pattern, guard_size); // Initalize front guard of reused block
-            memset(back_guard_reused, guard_pattern, guard_size); // Initialize back guard of reused block
-            memset(remainder_start, guard_pattern, guard_size); // Initialize front guard region of remainder block
-            memset(remainder_back_guard, guard_pattern, guard_size); // Initialize back guard region of remainder block
-            
-            // Update the pointer by derefecning it and setting it to user_ptr (which takes into account guard size)
-            *reused_user_ptr = user_ptr; 
-            // Update the pointer at old_md to store the original size, aligned size, and block_start of the reused block
-            *old_md = {0, sz, block_start, nullptr, 0}; 
-            
-            // Remove the old block from freed_allocations since it is being reused
-            freed_allocations.erase(it); 
-            // Add the remainder block to freed_allocations with original size 0 (since it is not being reused) and aligned size of remainder_size
-            freed_allocations[remainder_start] = {0, remainder_size, remainder_start, nullptr, 0}; 
-            return true; // Return true because a suitable block was found and reused
-            }
-        }
-        return false; // Return false if no suitable block was found
-    }   
+            char* back_guard_reused   = user_ptr + sz;
+            char* remainder_start     = back_guard_reused + guard_size;
+            char* remainder_user_ptr  = remainder_start + guard_size;
+            char* remainder_back_guard = remainder_user_ptr + remainder_size;
 
-// Malloc function with parameters for size, file, and line number (corresponds with error messgaes in m61_free)
-void* m61_malloc(size_t sz, const char* file, int line) {  
-    
-    // Avoid uninitialized variable warnings
-    (void) file, (void) line;
-    
-    // Check if no memory is being requested
-    if (sz == 0) { 
-        return nullptr; // Return nullptr if 0 requested
+            // guards for reused portion
+            memset(block_start, guard_pattern, guard_size);
+            memset(back_guard_reused, guard_pattern, guard_size);
+
+            // guards for remainder portion
+            memset(remainder_start, guard_pattern, guard_size);
+            memset(remainder_back_guard, guard_pattern, guard_size);
+
+            *reused_user_ptr = user_ptr;
+            *old_md = { 0, sz, block_start, nullptr, 0, buf, 0 };
+
+            // remove original free block and insert remainder as a new free block
+            freed_allocations.erase(it);
+            freed_allocations[remainder_start] =
+                { 0, remainder_size, remainder_start, nullptr, 0, buf, 0 };
+            return true;
+        }
     }
 
-    // Take the user requested size and store it in original_size for updating global statistics
-    size_t original_size = sz; 
+    return false;
+}
 
-    // Overflow Check: If requested size is bigger than SIZE_MAX - 16 (to account for guard regions)
-    if (sz > SIZE_MAX - 2 * guard_size){ 
-        // Then update statistics for failed allocation
-        ++gstats.nfail;
-        gstats.fail_size += sz;
-        return nullptr; // Return nullptr if overflow would occur
-        }
+/// m61_malloc(sz, file, line)
+/// returns a pointer to `sz` bytes, surrounded by guard bytes.
+/// may return nullptr on failure. does not call the system malloc.
+void* m61_malloc(size_t sz, const char* file, int line) {
     
-    // Ensure 16-byte alignment
-    size_t aligned_sz = sz; // Holds the size after alignment
-    size_t remainder = aligned_sz % guard_size; // Holds the remainder when sz is divided by 16 
-    
-    if (remainder != 0) { // If remainder is not 0, then sz is not a multiple of 16
-        size_t padding = guard_size - remainder; // Calculate how much padding is needed to make sz a multiple of 16 (and store in variable padding)
-        if (aligned_sz > SIZE_MAX - padding) { // Check for overflow before adding padding
-            // Update statistics and return nullptr if overflow occurs
-            ++gstats.nfail; 
-            gstats.fail_size += sz; 
-            return nullptr; 
-        }
-        // Add padding to aligned_sz
-        aligned_sz += padding; 
-    }
+    ensure_initial_buffer();
 
-    // Check if a freed block can be used first
-    void* reused_ptr = nullptr; // Pointer to hold the address of the reused block
-    allocationMetaData reused_md; // Variable to hold the metadata of the reused block
-    
-    // Implement m61_find_free_space to find a suitable freed block
-    if (m61_find_free_space(aligned_sz, &reused_ptr, &reused_md)){
-        char* userPointer = (char*)reused_ptr; // Pointer to the user-accessible memory of the reused block
-        char* blockStart = (char*)reused_md.block_start; // Pointer to the start of the reused block that takes into account guard regions)
-        
-        // Initalize guard regions of the reused block
-        memset(blockStart, guard_pattern, guard_size); 
-        memset(userPointer + aligned_sz, guard_pattern, guard_size); 
-
-        // Check if aligned_sz is greater than original_size
-        if (aligned_sz > original_size){
-            memset(userPointer + original_size, guard_pattern, aligned_sz - original_size); // Initialize the padding bytes to guard pattern
-        }
-    
-         // Update statistics for successful allocation
-         ++gstats.nactive; // Increase count of active allocations
-         gstats.active_size += original_size; // Add sz to active allocation bytes 
-         ++gstats.ntotal; // Increment total allocation count
-         gstats.total_size += original_size; // Increment total allocation size by sz
-
-         // Update metadata for this allocation in map active_allocations
-         active_allocations[userPointer] = {original_size, aligned_sz, blockStart, file, line}; 
-        
-         // Update heap_min & heap_max
-         uintptr_t allocBlock_Start = (uintptr_t) userPointer; // First address of the reused block 
-         uintptr_t allocBlock_End = allocBlock_Start + aligned_sz - 1; // Last address of the reused block
-         
-         // Check if heap_min is 0 or if allocBlock_Start is smaller than heap_min
-         if (gstats.heap_min == 0 || allocBlock_Start < gstats.heap_min) { // If new_FIRST is smaller than heap_min or if heap_min is 0
-                gstats.heap_min = allocBlock_Start;// Update heap_min to allocBlock_Start
-            }
-        // Check if allocBlock_End is greater than heap_max
-         if (allocBlock_End > gstats.heap_max) { 
-            gstats.heap_max = allocBlock_End; // Update heap_max to new_last
-            }
-        return userPointer; // Return pointer to the user-accessible memory of the reused block
-        }
-    
-    // Variable total_sz stores the total size needed for allocation including guard regions
-    size_t total_sz = aligned_sz + 2 * guard_size; 
-    
-    // Begin allocation from default_buffer
-    uintptr_t mem_address = (uintptr_t) &default_buffer.buffer[default_buffer.pos]; // Variable to hold current memory address in the buffer
-    size_t alignRequirement = alignof(std::max_align_t); // Variable to hold the alignment requirement (16 bytes)
-    uintptr_t alignedBlock_addr = (mem_address + (alignRequirement - 1)) & ~(uintptr_t)(alignRequirement - 1); // Variable to hold the aligned address of the block to be allocated
-    size_t padding = (size_t)(alignedBlock_addr - mem_address); // Variable to hold the padding needed to align the address
-    
-    // Check if there is enough space in the buffer for the allocation (including padding and guard regions)
-    if (padding + total_sz > default_buffer.size - default_buffer.pos) { 
-        // Update statistics for failed allocation and return nullptr if there is not enoguh space
-        ++gstats.nfail; 
-        gstats.fail_size += original_size; 
+    // malloc(0) is allowed. here i treat it as a “successful” allocation
+    // that returns nullptr, but it still counts towards ntotal.
+    if (sz == 0) {
+        ++gstats.ntotal;
+        // total_size += 0 is a no-op
         return nullptr;
     }
 
-    char* blockStart = (char*) alignedBlock_addr; // Pointer to the start of the block to be allocated (including guard regions)
-    char* user_ptr = blockStart + guard_size; // Pointer to the start of the user-acessible memory (after the front guard region)
+    size_t original_size = sz;
 
-    default_buffer.pos += padding + total_sz; 
-
-    memset(blockStart, guard_pattern, guard_size); // Set front guard region to guard pattern
-    memset(user_ptr + aligned_sz, guard_pattern, guard_size); // Set back guard region
-
-    if (aligned_sz > original_size){
-        memset(user_ptr + original_size, guard_pattern, aligned_sz - original_size); // Initialize the padding bytes to 0
+    // guard overflow: need space for sz + two guard regions
+    if (sz > SIZE_MAX - 2 * guard_size) {
+        ++gstats.nfail;
+        gstats.fail_size += sz;
+        return nullptr;
     }
 
-   
-    // Update statistics because allocation was successful
-    ++gstats.ntotal; 
-    gstats.total_size += original_size; 
-    ++gstats.nactive; 
-    gstats.active_size += original_size; 
-    // Update metadata for this allocation in map active_allocations
-    active_allocations[user_ptr] = {original_size, aligned_sz, blockStart, file, line};
-    allocation_history[user_ptr] = {original_size, aligned_sz, blockStart, file, line};
-
-
-    // Update heap_min & heap_max
-    uintptr_t new_first = (uintptr_t)user_ptr; // First address of the new allocation 
-    uintptr_t new_last = new_first + aligned_sz - 1; // Last address of the new allocation
-
-    // Check to be ensure heap_min and heap_max are updated correctly
-    if (gstats.heap_min == 0 || new_first < gstats.heap_min) { 
-            gstats.heap_min = new_first;
+    // round up to a multiple of guard_size so the payload is suitably aligned
+    size_t aligned_sz = sz;
+    size_t rem = aligned_sz % guard_size;
+    if (rem != 0) {
+        size_t padding = guard_size - rem;
+        if (aligned_sz > SIZE_MAX - padding) {
+            ++gstats.nfail;
+            gstats.fail_size += sz;
+            return nullptr;
         }
-    if (new_last > gstats.heap_max) { 
-        gstats.heap_max = new_last; 
+        aligned_sz += padding;
+    }
+
+    // if even one buffer cannot possibly hold this request, it is a hard fail
+    if (aligned_sz + 2 * guard_size > buffers.back()->size) {
+        ++gstats.nfail;
+        gstats.fail_size += sz;
+        return nullptr;
+    }
+
+    // first try to reuse a freed block from any existing buffer
+    void* reused_ptr = nullptr;
+    allocationMetaData reused_md;
+
+    for (auto* b : buffers) {
+        if (m61_find_free_space(b, aligned_sz, &reused_ptr, &reused_md)) {
+            char* user_ptr   = (char*) reused_ptr;
+            char* blockStart = (char*) reused_md.block_start;
+
+            // guards were already written in m61_find_free_space
+            // fill padding between original_size and aligned_sz with guard bytes
+            if (aligned_sz > original_size) {
+                memset(user_ptr + original_size,
+                       guard_pattern,
+                       aligned_sz - original_size);
+            }
+
+            // update stats
+            ++gstats.nactive;
+            gstats.active_size += original_size;
+            ++gstats.ntotal;
+            gstats.total_size += original_size;
+
+            // forward dec 
+            size_t total_span = aligned_sz + 2 * guard_size;
+
+            // track this allocation in both active and history maps
+            allocationMetaData md = {
+                original_size,
+                aligned_sz,
+                blockStart,
+                file,
+                line,
+                b, 
+                total_span
+            };
+            active_allocations[user_ptr] = md;
+            allocation_history[user_ptr] = md;
+
+            uintptr_t start = (uintptr_t) user_ptr;
+            uintptr_t end   = start + aligned_sz - 1;
+
+            if (gstats.heap_min == 0 || start < gstats.heap_min) {
+                gstats.heap_min = start;
+            }
+            if (end > gstats.heap_max) {
+                gstats.heap_max = end;
+            }
+
+            return user_ptr;
         }
+    }
+
+    // no reusable block worked; allocate from the “top” of the latest buffer
+    size_t total_sz = aligned_sz + 2 * guard_size;
+    m61_memory_buffer* buf = buffers.back();
+
+    // alignment explanation:
+
+    // buf->buffer + buf->pos is the next free byte in this buffer.
+    // want the user pointer to be aligned to alignof(max_align_t)
+    // (typically 16 bytes on x86_64) so that any type can safely live there.
+    //   do this by:
+    //   1. interpreting the current address as an integer (uintptr_t),
+    //   2. adding (align - 1), then
+    //   3. clearing the low bits with a bitmask
+    //
+    // this rounds “mem_address” up to the next multiple of `align`.
+    uintptr_t mem_address = (uintptr_t) (buf->buffer + buf->pos);
+    size_t alignRequirement = alignof(std::max_align_t);
+    uintptr_t alignedBlock_addr =
+        (mem_address + (alignRequirement - 1)) & ~(uintptr_t) (alignRequirement - 1);
+    size_t padding = (size_t) (alignedBlock_addr - mem_address);
+
+    // if this buffer cannot fit the aligned block plus guards, get a new buffer
+    if (padding + total_sz > buf->size - buf->pos) {
+        buffers.push_back(new m61_memory_buffer());
+        buf = buffers.back();
+
+        mem_address = (uintptr_t) (buf->buffer + buf->pos);
+        alignedBlock_addr =
+            (mem_address + (alignRequirement - 1)) & ~(uintptr_t) (alignRequirement - 1);
+        padding = (size_t) (alignedBlock_addr - mem_address);
+    }
+
+    // buf has space for the aligned block and guards
+    char* blockStart = (char*) alignedBlock_addr;
+    char* user_ptr   = blockStart + guard_size;
+
+    size_t total_span = aligned_sz + 2 * guard_size;
+
+    // advance the buffer “top” by the full span
+    buf->pos += total_span;
+
+    // write guard bytes around the payload
+    memset(blockStart, guard_pattern, guard_size);
+    memset(user_ptr + aligned_sz, guard_pattern, guard_size);
+
+    // fill padding between “real” size and aligned size with guard bytes too
+    if (aligned_sz > original_size) {
+        memset(user_ptr + original_size,
+               guard_pattern,
+               aligned_sz - original_size);
+    }
+
+    // stats
+    ++gstats.ntotal;
+    gstats.total_size += original_size;
+    ++gstats.nactive;
+    gstats.active_size += original_size;
+
+    allocationMetaData md = {
+        original_size,
+        aligned_sz,
+        blockStart,
+        file,
+        line,
+        buf, 
+        total_span
+    };
+    active_allocations[user_ptr] = md;
+    allocation_history[user_ptr] = md;
+
+    uintptr_t start = (uintptr_t) user_ptr;
+    uintptr_t end   = start + aligned_sz - 1;
+
+    if (gstats.heap_min == 0 || start < gstats.heap_min) {
+        gstats.heap_min = start;
+    }
+    if (end > gstats.heap_max) {
+        gstats.heap_max = end;
+    }
+
     return user_ptr;
-    }
-
+}
 
 /// m61_free(ptr, file, line)
-///    Frees the memory allocation pointed to by `ptr`. If `ptr == nullptr`,
-///    does nothing. Otherwise, `ptr` must point to a currently active
-///    allocation returned by `m61_malloc`. The free was called at location
-///    `file`:`line`.
-
-// Function that frees a previously allocated block of memory
+/// frees an active allocation. detects invalid frees, double frees,
+/// and simple wild writes using guard bytes.
 void m61_free(void* user_pointer, const char* file, int line) {
-    // Avoid uninitialized variable warnings
-    (void) file, (void) line;
-
-    // Handle nullptr case
     if (!user_pointer) {
         return;
     }
 
-    // Check if pointer is in active_allocations
     auto active_alloc = active_allocations.find(user_pointer);
-    // Pointer is not in active_allocations
-if (active_alloc == active_allocations.end()) {
 
-    auto hist = allocation_history.upper_bound(user_pointer);
-    if (hist != allocation_history.begin()) {
-        --hist;
+    // pointer is not currently active: figure out what kind of bug this is
+    if (active_alloc == active_allocations.end()) {
+        auto hist = allocation_history.upper_bound(user_pointer);
+        if (hist != allocation_history.begin()) {
+            --hist;
 
-        char* base = (char*) hist->first;
-        char* end  = base + hist->second.original_size;
+            char* base = (char*) hist->first;
+            char* end  = base + hist->second.original_size;
 
-        if (user_pointer == base) {
+            if (user_pointer == base) {
+                fprintf(stderr,
+                        "MEMORY BUG: %s:%d: invalid free of pointer %p, double free\n",
+                        file, line, user_pointer);
+                abort();
+            }
+
+            if ((char*) user_pointer > base && (char*) user_pointer < end) {
+                fprintf(stderr,
+                        "MEMORY BUG: %s:%d: invalid free of pointer %p, not allocated\n",
+                        file, line, user_pointer);
+                fprintf(stderr,
+                        "  %s:%d: %p is %td bytes inside a %zu byte region allocated here\n",
+                        hist->second.file,
+                        hist->second.line,
+                        user_pointer,
+                        (char*) user_pointer - base,
+                        hist->second.original_size);
+                abort();
+            }
+        }
+
+        uintptr_t addr = (uintptr_t) user_pointer;
+        if (addr < gstats.heap_min || addr > gstats.heap_max) {
             fprintf(stderr,
-                "MEMORY BUG: %s:%d: invalid free of pointer %p, double free\n",
-                file, line, user_pointer);
+                    "MEMORY BUG???: invalid free of pointer %p, not in heap\n",
+                    user_pointer);
             abort();
         }
 
-        if ((char*) user_pointer > base && (char*) user_pointer < end) {
-            fprintf(stderr,
+        fprintf(stderr,
                 "MEMORY BUG: %s:%d: invalid free of pointer %p, not allocated\n",
                 file, line, user_pointer);
-
-            fprintf(stderr,
-                "  %s:%d: %p is %td bytes inside a %zu byte region allocated here\n",
-                hist->second.file,
-                hist->second.line,
-                user_pointer,
-                (char*)user_pointer - base,
-                hist->second.original_size);
-            abort();
-        }
-    }
-
-    uintptr_t addr = (uintptr_t) user_pointer;
-    if (addr < gstats.heap_min || addr > gstats.heap_max) {
-        fprintf(stderr,
-            "MEMORY BUG???: invalid free of pointer %p, not in heap\n",
-            user_pointer);
         abort();
     }
 
-    fprintf(stderr,
-        "MEMORY BUG: %s:%d: invalid free of pointer %p, not allocated\n",
-        file, line, user_pointer);
-    abort();
-}
-
-    // Retreive metadata for the active allocation
+    // now know its an active alloc
     allocationMetaData meta = active_alloc->second;
 
-    // Create pointers to the start of the block, guard regions, and padding region
-    char* blockStart = (char*)meta.block_start;
+    // use parent_buffer directly; fall back to address-based search if needed
+    m61_memory_buffer* buf = meta.parent_buffer;
+    if (!buf) {
+        buf = find_buffer_for(meta.block_start);
+    }
+    if (!buf) {
+        fprintf(stderr,
+                "MEMORY BUG: %s:%d: invalid free of pointer %p, not in any buffer\n",
+                file, line, user_pointer);
+        abort();
+    }
+
+    char* blockStart = (char*) meta.block_start;
     char* guardStart = blockStart;
-    char* guardEnd = (char*)user_pointer + meta.aligned_size;
-    
-    // Create pointers to the padding region (if needed)
-    char* padStart = (char*)user_pointer + meta.original_size;
-    char* padEnd = (char*)user_pointer + meta.aligned_size;
-    
-    // Check front guard region to ensure allocation can be freed
+    char* guardEnd   = (char*) user_pointer + meta.aligned_size;
+
+    char* padStart = (char*) user_pointer + meta.original_size;
+    char* padEnd   = (char*) user_pointer + meta.aligned_size;
+
+    // front guard check
     for (size_t i = 0; i < guard_size; ++i) {
         if (((unsigned char*) guardStart)[i] != guard_pattern) {
-            fprintf(stderr, "MEMORY BUG???: %s:%d: detected wild write during free of pointer %p\n", file, line, user_pointer);
+            fprintf(stderr,
+                    "MEMORY BUG???: %s:%d: detected wild write during free of pointer %p\n",
+                    file, line, user_pointer);
             abort();
         }
     }
 
-    // Check padding region to ensure allocation can be freed
+    // padding check (between user size and aligned size)
     for (char* p = padStart; p < padEnd; ++p) {
-        if (*(unsigned char*)p != guard_pattern) {
-            fprintf(stderr, "MEMORY BUG???: %s:%d: detected wild write during free of pointer %p\n", file, line, user_pointer);
+        if (*(unsigned char*) p != guard_pattern) {
+            fprintf(stderr,
+                    "MEMORY BUG???: %s:%d: detected wild write during free of pointer %p\n",
+                    file, line, user_pointer);
             abort();
         }
-    }   
+    }
 
-    // Check back guard region to ensure allocation can be freed
+    // back guard check
     for (size_t i = 0; i < guard_size; ++i) {
         if (((unsigned char*) guardEnd)[i] != guard_pattern) {
-            fprintf(stderr, "MEMORY BUG???: %s:%d: detected wild write during free of pointer %p\n", file, line, user_pointer);
+            fprintf(stderr,
+                    "MEMORY BUG???: %s:%d: detected wild write during free of pointer %p\n",
+                    file, line, user_pointer);
             abort();
         }
     }
-    
-    // Update statistics indicating one less active allocation
+
+    // update stats for one fewer active allocation
     gstats.nactive--;
     gstats.active_size -= meta.original_size;
 
-    // Add block to freed_allocations for potential reuse
-    allocationMetaData freed_metadata = {0, meta.aligned_size, meta.block_start, nullptr, 0}; // original_size is not needed for freed blocks, so set to 0
-    auto freed_block = freed_allocations.insert({meta.block_start, freed_metadata}).first;
+    // insert this block into the per-buffer free list
+    auto& freed_allocations = freed_lists[buf];
+    allocationMetaData freed_metadata =
+        { 0, meta.aligned_size, meta.block_start, nullptr, 0, buf, 0 };
+    auto freed_block = freed_allocations.insert({ meta.block_start, freed_metadata }).first;
 
-
-    // Coalesce with next block if adjacent
-    while (true){
+    // coalesce with next block if it is immediately after us
+    while (true) {
         auto next = std::next(freed_block);
-        // Check if there is a next block
         if (next == freed_allocations.end()) {
-            break; 
+            break;
         }
 
-        // Pointer to the end of the current block including guard regions
-        char* end_of_current = (char*)freed_block->first + freed_block->second.aligned_size + 2 * guard_size;
-        
-        // Check if the next block is adjacent to the current block
-        if (end_of_current != (char*)next->first) {
-            break; 
+        char* end_of_current =
+            (char*) freed_block->first
+            + freed_block->second.aligned_size
+            + 2 * guard_size;
+
+        if (end_of_current != (char*) next->first) {
+            break;
         }
 
-        // Merge the two blocks
-        freed_block->second.aligned_size += next->second.aligned_size + 2 * guard_size;
-        // Remove the next block from freed_allocations since it has been merged
+        freed_block->second.aligned_size +=
+            next->second.aligned_size + 2 * guard_size;
         freed_allocations.erase(next);
-    } 
+    }
 
-    // Coalesce with previous block if adjacent
+    // coalesce with previous block if it is immediately before us
     while (freed_block != freed_allocations.begin()) {
-        // Get the previous block
         auto prev = std::prev(freed_block);
-        char* endPrev = (char*) prev->first + prev->second.aligned_size + 2 * guard_size;
-        // Check if the previous block is adjacent to the current block
+        char* endPrev =
+            (char*) prev->first
+            + prev->second.aligned_size
+            + 2 * guard_size;
+
         if (endPrev != (char*) freed_block->first) {
-            break; 
+            break;
         }
 
-        // Merge the two blocks
-        prev->second.aligned_size += freed_block->second.aligned_size + 2 * guard_size;
-        // Remove the current block from freed_allocations since it has been merged
+        prev->second.aligned_size +=
+            freed_block->second.aligned_size + 2 * guard_size;
         freed_allocations.erase(freed_block);
-        // Update freed_block to point to the previous block for potential further coalescing
         freed_block = prev;
     }
 
-    // Handle case where freed block is at the top of the buffer
-    char* heapTop = default_buffer.buffer + default_buffer.pos; // Pointer to the top of the heap (end of used portion of buffer)
-    char* freedBlock_end = (char*) freed_block->first + freed_block->second.aligned_size + 2 * guard_size; // Pointer to the end of the freed block including guard regions
-    
-    // Check if the freed block is at the top of the heap
-    if (freedBlock_end == heapTop){
-        default_buffer.pos = (size_t)((char*) freed_block->first - default_buffer.buffer); // Move the top of the heap down to the start of the freed block
-        freed_allocations.erase(freed_block); // Erase the freed block from freed_allocations since it has been removed from the heap
+    // if the top of the heap is now a free block, move buf->pos down
+    char* heapTop = buf->buffer + buf->pos;
+    char* freedBlock_end =
+        (char*) freed_block->first
+        + freed_block->second.aligned_size
+        + 2 * guard_size;
 
-        // While loop to coalesce any other adjacent freed blocks at the top of the heap
-        while (!freed_allocations.empty()){ 
-            // Find the last block in freed_allocations that is before the current top of the heap
-            auto last = freed_allocations.upper_bound((void*)(default_buffer.buffer + default_buffer.pos));
-            // Check if there is a last block
+    if (freedBlock_end == heapTop) {
+        buf->pos = (size_t) ((char*) freed_block->first - buf->buffer);
+        freed_allocations.erase(freed_block);
+
+        // keep pulling the top down while the last bytes belong to freed blocks
+        while (!freed_allocations.empty()) {
+            auto last = freed_allocations.upper_bound((void*) (buf->buffer + buf->pos));
             if (last == freed_allocations.begin()) {
-                    break;
-                }
-            // Get the previous block
+                break;
+            }
+
             auto prev = std::prev(last);
-            char* endBlock = (char*) prev->first + prev->second.aligned_size + 2 * guard_size;
-            // Check if the previous block is adjacent to the current top of the heap
-            if (endBlock != default_buffer.buffer + default_buffer.pos) {
-                    break;
-                }
-            // Move the top of the heap down to the start of the previous block
-            default_buffer.pos = (size_t)((char*) prev->first - default_buffer.buffer);
-            // Remove the previous block from freed_allocations since it has been removed from the heap
+            char* endBlock =
+                (char*) prev->first
+                + prev->second.aligned_size
+                + 2 * guard_size;
+
+            if (endBlock != buf->buffer + buf->pos) {
+                break;
+            }
+
+            buf->pos = (size_t) ((char*) prev->first - buf->buffer);
             freed_allocations.erase(prev);
         }
-        
     }
-    // Erase the allocation from active_allocations since it has been freed
+
     active_allocations.erase(active_alloc);
-    }
-
-
-/// m61_calloc(count, sz, file, line)
-///    Returns a pointer a fresh dynamic memory allocation big enough to
-///    hold an array of `count` elements of `sz` bytes each. Returned
-///    memory is initialized to zero. The allocation request was at
-///    location `file`:`line`. Returns `nullptr` if out of memory; may
-///    also return `nullptr` if `count == 0` or `size == 0`.
-
-// Function that allocates memory for an array of x elements of y bytes each and ititializes all bytes to 0
-void* m61_calloc(size_t count, size_t sz, const char* file, int line) {
-    (void) file, (void) line; // Avoid unused variable warnings
-
-    // Check if count or sz is 0
-    if (count == 0 || sz == 0) { 
-       return nullptr; 
-    }
-    
-    // Check for overflow
-    if (count > (SIZE_MAX / sz)) { 
-        ++ gstats.nfail; 
-        gstats.fail_size += count * sz; 
-        return nullptr; 
-    }
-    
-    // Variable total_size stores the total size needed for allocation
-    size_t total_size = count * sz; 
-    // Allocate memory using m61_malloc and store the returned pointer in ptr
-    void* ptr = m61_malloc(total_size, file, line); 
-
-    // Check if allocation failed
-    if (!ptr) { 
-        return nullptr;
-    }
-    
-    // Set all bytes in the allocated memory to zero using memset
-    memset(ptr, 0, total_size); 
-
-    // Return pointer to the allocated memory
-    return ptr;
 }
 
+/// m61_calloc(count, sz, file, line)
+/// allocate count * sz bytes and zero them.
+void* m61_calloc(size_t count, size_t sz, const char* file, int line) {
+    if (count == 0 || sz == 0) {
+        return nullptr;
+    }
 
-/// m61_get_statistics()
-///    Return the current memory statistics.
+    if (count > SIZE_MAX / sz) {
+        ++gstats.nfail;
+        gstats.fail_size += count * sz;
+        return nullptr;
+    }
+
+    size_t total_size = count * sz;
+    void* ptr = m61_malloc(total_size, file, line);
+    if (!ptr) {
+        return nullptr;
+    }
+
+    memset(ptr, 0, total_size);
+    return ptr;
+}
 
 m61_statistics m61_get_statistics() {
     return gstats;
 }
 
-
 /// m61_realloc(ptr, sz, file, line)
-///    Changes the size of the dynamic allocation pointed to by `ptr`
-///    to hold at least `sz` bytes. If the existing allocation cannot be
-///    enlarged, this function makes a new allocation, copies as much data
-///    as possible from the old allocation to the new, and returns a pointer
-///    to the new allocation. If `ptr` is `nullptr`, behaves like
-///    `m61_malloc(sz, file, line). `sz` must not be 0. If a required
-///    allocation fails, returns `nullptr` without freeing the original
-///    block.
-
+/// simple realloc built on top of m61_malloc and m61_free.
 void* m61_realloc(void* ptr, size_t sz, const char* file, int line) {
-    // check if ptr is valid before allocating
     if (!ptr) {
         return m61_malloc(sz, file, line);
     }
 
-    // j like in malloc, can't realloc size 0
-    // so need to allocate at least 1 byte
     if (sz == 0) {
+        // spec says sz must not be 0, so treat as malloc(1)
         return m61_malloc(1, file, line);
     }
 
-    // look up old allocation metadata
-    // it holds the iterator to the found allocation
     auto it = active_allocations.find(ptr);
-
-    // if not held in active allocation map, can't be reallocated
     if (it == active_allocations.end()) {
-        // so 
+        // cannot safely realloc something not currently allocated
         return nullptr;
     }
 
-    // now can get old size from metadata
     allocationMetaData old = it->second;
     size_t old_size = old.original_size;
 
-    // if new size fits in existing block, j keep it
+    // shrinking in place is easy
     if (sz <= old_size) {
-        // shrink in place: update metadata but do NOT move pointer
+        gstats.active_size -= (old_size - sz);
         it->second.original_size = sz;
         return ptr;
     }
 
-    // using malloc to allocate new block
+    // need a bigger block
     void* new_ptr = m61_malloc(sz, file, line);
-    // handle if it fails
     if (!new_ptr) {
         return nullptr;
     }
 
-    // copy only the data that originally existed
     memcpy(new_ptr, ptr, old_size);
-
-    // now free the old block
     m61_free(ptr, file, line);
-
     return new_ptr;
 }
-
-
-/// m61_print_statistics()
-///    Prints the current memory statistics.
 
 void m61_print_statistics() {
     m61_statistics stats = m61_get_statistics();
@@ -575,18 +608,12 @@ void m61_print_statistics() {
            stats.nactive, stats.ntotal, stats.nfail);
     printf("alloc size:  active %10llu   total %10llu   fail %10llu\n",
            stats.active_size, stats.total_size, stats.fail_size);
-      }
-
-
-/// m61_print_leak_report()
-///    Prints a report of all currently-active allocated blocks of dynamic
-///    memory.
+}
 
 void m61_print_leak_report() {
     for (auto& it : active_allocations) {
         void* user_ptr = it.first;
         allocationMetaData md = it.second;
-
         printf("LEAK CHECK: %s:%d: allocated object %p with size %zu\n",
                md.file, md.line, user_ptr, md.original_size);
     }
