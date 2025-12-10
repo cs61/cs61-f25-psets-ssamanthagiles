@@ -19,6 +19,17 @@
     // TYPE_SEQUENCE = ;
     // TYPE_PIPE = |
 
+
+// signal handler for SIGINT
+volatile sig_atomic_t fg_pgid = -1;
+
+void sigint_handler(int) {
+    if (fg_pgid > 0) {
+        kill(-fg_pgid, SIGINT);   // kill whole foreground pipeline
+    }
+}
+    
+
 // command structure 
 struct command {
 
@@ -101,76 +112,58 @@ void command::run() {
         _exit(EXIT_FAILURE);
     
     // if fork return value is 0, then in child process
-    } else if (child_pid == 0) {
+} else if (child_pid == 0) {
+    // child: apply redirections, then execvp
 
-        // check for input redirections (<) of a file
-        // if not empty,
-        if (!infile.empty()) {
-            // then there is an infile redirection
-            // open infile in read only mode
-            int fd = open(infile.c_str(), O_RDONLY);
-            // if opening file descriptor fails
-            if (fd < 0) {
-                perror(infile.c_str());
-                // exit child process (not whole shell)
-                _exit(1);
-            }
-            // dup2 is used to duplicate file descriptors
-            // redirect stdin to infile
-            dup2(fd, STDIN_FILENO);
-            // now close after handling infile redirection
-            close(fd);
+    // stdin redirection
+    if (!infile.empty()) {
+        int fd = open(infile.c_str(), O_RDONLY);
+        if (fd < 0) { perror(infile.c_str()); _exit(1); }
+        dup2(fd, STDIN_FILENO);
+        close(fd);
+    }
+
+    // stdout redirection (> or >>)
+    if (!outfile.empty()) {
+        bool append = false;
+        std::string fn = outfile;
+
+        // '+' prefix means append (set by parser)
+        if (outfile[0] == '+') {
+            append = true;
+            fn = outfile.substr(1);
         }
 
-        // check for output redirections (>) of a file
-        // if not empty,
-        if (!outfile.empty()) {
-            // then there is an outfile redirection
-            // open outfile in write only mode, create if doesn't exist, truncate if exists
-            int fd = open(outfile.c_str(),
-                          O_WRONLY | O_CREAT | O_TRUNC,
-                          0666);
-            // if opening file descriptor fails
-            if (fd < 0) {
-                perror(outfile.c_str());
-                // exit child process (not whole shell)
-                _exit(1);
-            }
-            // redirect stdout to outfile
-            dup2(fd, STDOUT_FILENO);
-            // now close after handling outfile redirection
-            close(fd);
+        int flags = O_WRONLY | O_CREAT | (append ? O_APPEND : O_TRUNC);
+        int outfd = open(fn.c_str(), flags, 0666);
+        if (outfd < 0) { perror(fn.c_str()); _exit(1); }
+
+        dup2(outfd, STDOUT_FILENO);
+        close(outfd);
+    }
+
+    // stderr redirection (2> or 2>>)
+    if (!errfile.empty()) {
+        bool append = false;
+        std::string fn = errfile;
+
+        if (errfile[0] == '+') {
+            append = true;
+            fn = errfile.substr(1);
         }
 
-        // check for error redirections (2>) of a file
-        // if not empty,
-        if (!errfile.empty()) {
-            // then there is an errfile redirection
-            // open errfile in write only mode, create if doesn't exist, truncate if exists
-            int fd = open(errfile.c_str(),
-                          O_WRONLY | O_CREAT | O_TRUNC,
-                          0666);
-            // if opening file descriptor fails
-            if (fd < 0) {
-                perror(errfile.c_str());
-                // exit child process (not whole shell)
-                _exit(1);
-            }
-            // redirect stderr to errfile
-            dup2(fd, STDERR_FILENO);
-            // now close after handling errfile redirection
-            close(fd);
-        }
+        int flags = O_WRONLY | O_CREAT | (append ? O_APPEND : O_TRUNC);
+        int errfd = open(fn.c_str(), flags, 0666);
+        if (errfd < 0) { perror(fn.c_str()); _exit(1); }
 
-        // now execute the command in the child process
-        execvp(argv[0], argv.data());
-        // if execvp returns instead of replacing process image, there was an error
-        perror("execvp");
-        // exit child process (not whole shell)
-        _exit(EXIT_FAILURE);
-    } else {
-        // in parent process, store child pid in command struct
-        this->pid = child_pid;
+        dup2(errfd, STDERR_FILENO);
+        close(errfd);
+    }
+
+    // exec
+    execvp(argv[0], argv.data());
+    perror("execvp");
+    _exit(EXIT_FAILURE);
     }
 }
 
@@ -205,9 +198,31 @@ int run_command(command_parser cmdpar) {
              
              // if operator is <, >, or 2>, set appropriate redirection filename
              // based on temp variables declared above that will be stored in command struct
-             if (op == "<")       c->infile = fname;
-             else if (op == ">")  c->outfile = fname;
-             else if (op == "2>") c->errfile = fname;
+             if (op == "<") {
+                c->infile = fname;
+            }
+            else if (op == ">") {
+                c->outfile = fname;
+            }
+            else if (op == ">>") {
+                c->outfile = "+" + fname;     // mark append
+            }
+            else if (op == "2>") {
+                c->errfile = fname;
+            }
+            else if (op == "2>>") {
+                c->errfile = "+" + fname;     // mark append
+            }
+            else if (op == "&>") {
+                c->outfile = fname;
+                c->errfile = fname;
+            }
+            else if (op == "&>>") {
+                c->outfile = "+" + fname;     // append stdout
+                c->errfile = "+" + fname;     // append stderr
+            }
+            
+            
              
              // iterate over to next token
              ++tok;
@@ -377,10 +392,12 @@ int run_command(command_parser cmdpar) {
     // wait for child to finish executing command 
     if (c->pid > 0) {
         // if waitpid fails (when command is interrupted by signal)
-        if (waitpid(c->pid, &status, 0) < 0) {
-            // indicate error
+        int rc;
+        while ((rc = waitpid(c->pid, &status, 0)) < 0) {
+            if (errno == EINTR) {
+                continue;   // retry if interrupted by signal
+            }
             perror("waitpid");
-            // exit shell
             _exit(EXIT_FAILURE);
         }
     }
@@ -437,6 +454,8 @@ int run_pipeline(pipeline_parser pipepar) {
     // last_pid holds pid of last command in the pipeline during forking
     // initialize to -1 to indicate no pid yet
     pid_t last_pid = -1;
+    pid_t pgid = -1; // pipeline process group id
+
 
     // loop over commands in the pipeline
     for (auto cmdpar = pipepar.command_begin(); cmdpar != pipepar.end();
@@ -456,6 +475,14 @@ int run_pipeline(pipeline_parser pipepar) {
         // if fork succeeded
         if (pid == 0) {
             
+            // child: join or create pgid
+            if (cmd_index == 0) {
+                setpgid(0, 0);    // first command creates new group
+            } else {
+                setpgid(0, pgid); // others join group
+            }
+
+
             // vector that holds arguments for execvp
             std::vector<std::string> args;
 
@@ -583,49 +610,43 @@ int run_pipeline(pipeline_parser pipepar) {
 
             // OUTPUT redirection (> file)
             // if outfile is not empty,
+            // stdout redirection (> or >>)
             if (!outfile.empty()) {
-                // open outfile in write only mode, create if doesn't exist, truncate if exists
-                int fd = open(outfile.c_str(),
-                              O_WRONLY | O_CREAT | O_TRUNC,
-                              0666);
-                // if opening file descriptor fails
-                if (fd < 0) {
-                    perror(outfile.c_str());
-                    // exit child process (not whole shell)
-                    _exit(1);
+                bool append = false;
+                std::string fn = outfile;
+
+                if (outfile[0] == '+') {
+                    append = true;
+                    fn = outfile.substr(1);
                 }
-                // redirect stdout to outfile
-                // if duplicating the fd fails
-                if (dup2(fd, STDOUT_FILENO) < 0) {
-                    perror("dup2");
-                    // exit child process (not whole shell)
-                    _exit(1);
-                }
-                // close after handling outfile redirection
+
+                int flags = O_WRONLY | O_CREAT | (append ? O_APPEND : O_TRUNC);
+
+                int fd = open(fn.c_str(), flags, 0666);
+                if (fd < 0) { perror(fn.c_str()); _exit(1); }
+
+                dup2(fd, STDOUT_FILENO);
                 close(fd);
             }
 
             // STDERR redirection (2> file)
             // if errfile is not empty,
+            // stderr redirection (2> or 2>>)
             if (!errfile.empty()) {
-                // open errfile in write only mode, create if doesn't exist, truncate if exists
-                int fd = open(errfile.c_str(),
-                              O_WRONLY | O_CREAT | O_TRUNC,
-                              0666);
-                // if opening file descriptor fails
-                if (fd < 0) {
-                    perror(errfile.c_str());
-                    // exit child process (not whole shell)
-                    _exit(1);
+                bool append = false;
+                std::string fn = errfile;
+
+                if (errfile[0] == '+') {
+                    append = true;
+                    fn = errfile.substr(1);
                 }
-                // redirect stderr to errfile
-                // if duplicating the fd fails
-                if (dup2(fd, STDERR_FILENO) < 0) {
-                    perror("dup2");
-                    // exit child process (not whole shell)
-                    _exit(1);
-                }
-                // close after handling errfile redirection
+
+                int flags = O_WRONLY | O_CREAT | (append ? O_APPEND : O_TRUNC);
+
+                int fd = open(fn.c_str(), flags, 0666);
+                if (fd < 0) { perror(fn.c_str()); _exit(1); }
+
+                dup2(fd, STDERR_FILENO);
                 close(fd);
             }
 
@@ -649,13 +670,22 @@ int run_pipeline(pipeline_parser pipepar) {
         // then fork succeeded, so back in parent process
 
         else {
-           // continue to next command in pipeline to fork...
+            // parent: assign pipeline process group
+            if (cmd_index == 0) {
+                pgid = pid;               // group leader
+                setpgid(pid, pgid);
+                fg_pgid = pgid;           // foreground job control
+            } else {
+                setpgid(pid, pgid);
+            }
+        
             if (cmd_index == n - 1) {
-                // update last_pid to pid of last command that was forked
                 last_pid = pid;
             }
         }
+        
     }
+
 
     // parent has to close ALL pipe file descriptors after forking all children
     for (int i = 0; i < n - 1; i++) {
@@ -671,12 +701,18 @@ int run_pipeline(pipeline_parser pipepar) {
     // status of pipeline is status of last command of child processes
     int status;
     // if waitpid fails
-    if (waitpid(last_pid, &status, 0) < 0) {
-        // indicate error
+    int rc;
+    while ((rc = waitpid(last_pid, &status, 0)) < 0) {
+        if (errno == EINTR) {
+            continue;
+        }
+        
         perror("waitpid");
-        // exit shell
         _exit(EXIT_FAILURE);
     }
+
+    fg_pgid = -1;
+
 
     // convert waitpid status to WEXITSTATUS after waiting for all children
     if (WIFEXITED(status)) {
@@ -807,6 +843,8 @@ int main(int argc, char* argv[]) {
     //   into the foreground
     claim_foreground(0);
     set_signal_handler(SIGTTOU, SIG_IGN);
+
+    set_signal_handler(SIGINT, sigint_handler);
 
     char buf[BUFSIZ];
     int bufpos = 0;
