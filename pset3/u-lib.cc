@@ -40,3 +40,38 @@ void assert_fail(const char* file, int line, const char* msg,
     }
     sys_panic(buf);
 }
+
+// syscall wrappers (for ec)
+
+long syscall(long num, long arg1, long arg2, long arg3);
+
+
+// uptime()
+long uptime() {
+    return syscall(SYSCALL_UPTIME, 0, 0, 0);
+}
+
+// sleep(ticks)
+long sleep(long duration) {
+    return syscall(SYSCALL_SLEEP, duration, 0, 0);
+}
+
+// random()
+long random() {
+    return syscall(SYSCALL_RANDOM, 0, 0, 0);
+}
+
+// random_kernel()  -- only if you actually have SYSCALL_RANDOMKERNEL in lib.hh
+long random_kernel() {
+    return syscall(SYSCALL_RANDOMKERNEL, 0, 0, 0);
+}
+
+// kill(pid)
+long kill(int pid) {
+    return syscall(SYSCALL_KILL, pid, 0, 0);
+}
+
+// free a user page
+long page_free(uintptr_t addr) {
+    return syscall(SYSCALL_PAGE_FREE, addr, 0, 0);
+}

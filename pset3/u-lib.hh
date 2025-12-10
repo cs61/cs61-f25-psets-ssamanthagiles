@@ -132,4 +132,35 @@ inline pid_t sys_fork() {
     }
 }
 
-#endif
+// sys_uptime()
+//    return number of timer ticks since boot.
+inline long sys_uptime() {
+    return make_syscall(SYSCALL_UPTIME);
+}
+
+// sys_sleep(duration)
+//    sleep for `duration` timer ticks.
+inline long sys_sleep(long duration) {
+    return make_syscall(SYSCALL_SLEEP, duration);
+}
+
+// sys_random()
+//    return random number.
+inline long sys_random() {
+    return make_syscall(SYSCALL_RANDOM);
+}
+
+// sys_kill(pid)
+//    kill another process by pid.
+inline long sys_kill(int pid) {
+    return make_syscall(SYSCALL_KILL, pid);
+}
+
+// sys_page_free(addr)
+//    free an allocated user page.
+inline long sys_page_free(void* addr) {
+    return make_syscall(SYSCALL_PAGE_FREE,
+                        reinterpret_cast<uintptr_t>(addr));
+}
+
+#endif 

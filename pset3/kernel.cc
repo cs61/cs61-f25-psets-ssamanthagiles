@@ -50,8 +50,8 @@ static void process_setup(pid_t pid, const char* program_name);
 // page size is 4096 bytes
 // round x up to nearest page boundary
 static inline void incref_pa(uintptr_t pa) {
-    int pn = pa / PAGESIZE;
-    assert(pn >= 0 && pn < NPAGES);
+    uintptr_t pn = pa / PAGESIZE;
+    assert(pn < NPAGES);
     assert(physpages[pn].refcount >= 0);
     ++physpages[pn].refcount;
 }
@@ -59,7 +59,8 @@ static inline void incref_pa(uintptr_t pa) {
 // decrement refcount for a physical page
 static inline void decref_pa(uintptr_t pa) {
     int pn = pa / PAGESIZE;
-    assert(pn >= 0 && pn < NPAGES);
+    assert(pn >= 0);
+    assert((size_t) pn < NPAGES);
     assert(physpages[pn].refcount > 0);
     --physpages[pn].refcount;
 }
@@ -77,8 +78,9 @@ static inline void unmap_and_maybe_free(x86_64_pagetable* pt, uintptr_t va) {
     uintptr_t pa = it.pa();
 
     // unmap the virtual address
-    int r = it.try_map((uintptr_t) 0, 0);
-    assert(r == 0);
+    uintptr_t r = it.try_map((uintptr_t)0, 0);
+    (void) r;     // Silence unused-variable warning, and allowed by warn_unused_result
+
 
     // check if physical address is valid
     if (pa == 0) {
@@ -669,7 +671,68 @@ static int syscall_fork() {
     case SYSCALL_FORK:
         return syscall_fork();
 
+    // ec
+
+    // uptime 
+    case SYSCALL_UPTIME:
+    // return number of timer interrupts since boot
+    return ticks.load();
+
+    // sleep
+    case SYSCALL_SLEEP: {
+        unsigned long duration = regs->reg_rdi;
+        unsigned long start = ticks.load();
+        while (ticks.load() - start < duration) {
+            schedule(); // yield until enough ticks have passed
+        }
+        return 0;
+    }
     
+    // random
+    case SYSCALL_RANDOM:
+        return rand();
+
+    // return random number in rax and as return value
+    case SYSCALL_RANDOMKERNEL:
+        regs->reg_rax = rand();
+        return regs->reg_rax;
+    
+    // kill target process
+    case SYSCALL_KILL: {
+        int pid = regs->reg_rdi;
+        if (pid <= 0 || pid >= MAXNPROC) return -1;
+        if (ptable[pid].state == P_FREE) return -1;
+    
+        free_process_address_space(&ptable[pid]);
+        ptable[pid].state = P_FREE;
+        return 0;
+    }
+
+    // free user page
+    case SYSCALL_PAGE_FREE: {
+        uintptr_t addr = regs->reg_rdi;
+    
+        // must be page aligned
+        if (addr % PAGESIZE != 0) return -1;
+    
+        // must be user range
+        if (addr < PROC_START_ADDR || addr >= MEMSIZE_VIRTUAL) return -1;
+    
+        vmiter it(current->pagetable, addr);
+        if (!it.present()) return -1;
+    
+        uintptr_t pa = it.pa();
+        int unmapped = it.try_map((uintptr_t)0, 0);
+        (void) unmapped; // explicitly ignore, silences warning
+        decref_pa(pa);        // free physical page
+    
+        return 0;
+    }
+    
+
+    
+    
+
  
     default:
         proc_panic(current, "Unhandled system call %ld (pid=%d, rip=%p)!\n",

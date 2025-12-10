@@ -228,6 +228,9 @@ run-monitor-$(RUNSUFFIX): run-monitor
 run-gdb-$(RUNSUFFIX): run-gdb
 run-gdb-graphic-$(RUNSUFFIX): run-gdb-graphic
 run-gdb-console-$(RUNSUFFIX): run-gdb-console
+run-testprogram: p-testprogram
+	./run-wqemu.sh testprogram
+
 
 # Stop all my qemus
 stop kill:
