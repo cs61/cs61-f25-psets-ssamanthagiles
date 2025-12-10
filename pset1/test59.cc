@@ -2,7 +2,7 @@
 #include <cstdio>
 #include <cassert>
 
-// Test: Allocator must create a second buffer once the first fills.
+// make sure allocator creates a new buffer when needed
 
 int main() {
     // Allocate slightly less than a full buffer (just under 8 MiB)
