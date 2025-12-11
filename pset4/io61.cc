@@ -196,33 +196,36 @@ int io61_readc(io61_file* f) {
         // therefore need to fill cache with file data
         ssize_t filled = cache_fill(f); 
         // filled can't be <= 0 bc need at least one byte to read
+        // handle refill failures
         if (filled <= 0) {
-            if (filled < 0 &&
-                (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) {
+
+        // retry only if temporary error
+        if (filled < 0 &&
+        (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) {
+
+        // try clearing and refilling once
+        f->tag = f->end_tag = f->pos;
+        filled = cache_fill(f);
+
+        if (filled <= 0) {
+            return -1; // still nothing → give up
+        }
+
+        } else {
+            // either EOF (filled == 0) or real error (filled < 0)
+            return -1;
+        }
         
-                // Try again: clear cache and retry once
-                f->tag = f->end_tag = f->pos;
-                filled = cache_fill(f);
-                if (filled <= 0) {
-                    return -1;
-                }
-        
-            } else if (filled == 0) {
-                // EOF
-                return -1;
-            } else {
-                return -1;
-            }
         }
     }
 
-    // now can read a single byte from the cache
+    // extract byte
     unsigned char ch = f->cbuf[f->pos - f->tag];
-    // advance current position by 1 (bc just reading one byte)
-    f->pos += 1; 
-    // return the byte read, cast to int to match return type
-    // return type is int bc in the case where EOF or error occurs, need to return -1 
+    f->pos += 1;
     return (int) ch;
+
+    // safety return (should never be hit)
+    return -1;
 }
 
 // io61_read(f, buf, sz)
@@ -436,7 +439,7 @@ ssize_t io61_write(io61_file* f, const unsigned char* buf, size_t sz) {
         }
 
         // copy as much as possible into buffer
-        size_t copy_sz = std::min(space, sz - nwritten);
+        size_t copy_sz = (space < (sz - nwritten) ? space : (sz - nwritten));
         memcpy(f->wbuf + used, buf + nwritten, copy_sz);
 
         // update buffer and file state after copying
@@ -563,7 +566,7 @@ int io61_seek(io61_file* f, off_t off) {
       unsigned char tmp[4096];
   
       while (remain > 0) {
-          size_t chunk = remain < (off_t) sizeof(tmp) ? remain : sizeof(tmp);
+          size_t chunk = (remain < (off_t)sizeof tmp ? remain : (off_t)sizeof tmp);
           ssize_t nr = read(f->fd, tmp, chunk);
           if (nr <= 0) return -1;
           f->pipe_highwater += nr;
